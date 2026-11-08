@@ -2,6 +2,11 @@ name: Build Launcher Releases
 
 on:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Optional existing release tag to upload assets to, for example 0.3'
+        required: false
+        type: string
   push:
     tags:
       - '*.*'
@@ -22,11 +27,11 @@ jobs:
             platform: windows
             asset_name: WibsverseLauncher-windows-x64.exe
           - name: macOS Intel
-            runner: macos-13
+            runner: macos-15-intel
             platform: macos
             asset_name: WibsverseLauncher-mac-x64.zip
           - name: macOS Apple Silicon
-            runner: macos-14
+            runner: macos-15
             platform: macos
             asset_name: WibsverseLauncher-mac-arm64.zip
 
@@ -68,7 +73,7 @@ jobs:
 
   release:
     name: Publish GitHub release assets
-    if: startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/') || inputs.release_tag != ''
     needs: build
     runs-on: ubuntu-latest
 
@@ -82,7 +87,7 @@ jobs:
       - name: Create or update release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ inputs.release_tag || github.ref_name }}
         shell: bash
         run: |
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --generate-notes || true

@@ -96,7 +96,7 @@ The `.github/workflows/build-release.yml` workflow builds all three native packa
 - macOS Intel `.app` archive
 - macOS Apple Silicon `.app` archive
 
-Run it manually from the repository's **Actions** tab, or push a numeric version tag to build and publish a GitHub release automatically:
+Run it manually from the repository's **Actions** tab to produce build artifacts. To upload a manual run to an existing release, enter its tag in the optional `release_tag` field. Or push a numeric version tag to build and publish a GitHub release automatically:
 
 ```powershell
 git tag 0.4
