@@ -11,6 +11,8 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+from core import LAUNCHER_VERSION
+
 PROFILE_BASE = "https://sessionserver.mojang.com/session/minecraft/profile/"
 SKIN_HOST = "textures.minecraft.net"
 AVATAR_HOST = "mc-heads.net"
@@ -46,7 +48,7 @@ def texture_url_from_profile(profile: dict) -> str | None:
 
 
 def _limited_urlopen(url: str, allowed_host: str, size_limit: int) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": "WibsverseLauncher/0.2"})
+    req = urllib.request.Request(url, headers={"User-Agent": f"WibsverseLauncher/{LAUNCHER_VERSION}"})
     with urllib.request.urlopen(req, timeout=10) as response:
         final = urllib.parse.urlparse(response.geturl())
         if final.scheme != "https" or final.hostname != allowed_host:

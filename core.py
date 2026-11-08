@@ -8,8 +8,10 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import time
+import tarfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -21,6 +23,8 @@ from pathlib import Path, PurePosixPath
 from typing import Callable
 
 DOWNLOAD_PAGE = "https://wibsverse.com/download"
+LAUNCHER_VERSION = "0.3"
+LAUNCHER_RELEASES_API = "https://api.github.com/repos/YeeticusFinch/wibseverse-launcher/releases"
 SERVER = "play.wibsverse.com"
 MINECRAFT_VERSION = "1.20.1"
 FORGE_VERSION = "47.4.23"
@@ -28,12 +32,16 @@ INSTANCE_ID = "wibsverse-demon-slayer"
 HMC_PROFILE_NAME = "wibsverse"
 HMC_ROOT_NAME = "HeadlessMc"
 HMC_VERSION = "3.0.0-RC8"
-HMC_ASSET = "headlessmc-launcher-windows-x64.exe"
-HMC_DOWNLOAD_URL = (
-    "https://github.com/headlesshq/headlessmc/releases/download/"
-    f"{HMC_VERSION}/{HMC_ASSET}"
-)
-HMC_SHA256 = "72c42ddd7240f08c79615bbf5e9bef15d209d3e75017f4ef9d9dde9f5028f935"
+HMC_RELEASES = {
+    ("windows", "x64"): ("headlessmc-launcher-windows-x64.exe", "72c42ddd7240f08c79615bbf5e9bef15d209d3e75017f4ef9d9dde9f5028f935"),
+    ("macos", "x64"): ("headlessmc-launcher-macos-x64", "d37e9d206b0245f13f9855c16c3ebb1554542fa694b10bcaacf2afe5b928fb67"),
+    ("macos", "arm64"): ("headlessmc-launcher-macos-arm64", "fc9d636a715a206e11480869c2ef7e97a9ba919e84d56b376aa301360d105060"),
+    ("linux", "x64"): ("headlessmc-launcher-linux-x64", "62bbcd85344470bc1c11e08be4eda33ce06aeff2ed2931c87964640d5a733ece"),
+    ("linux", "arm64"): ("headlessmc-launcher-linux-arm64", "0d5298df7f344b529cb63c1203e8e25ccb0f3bb58d6795e38ad8f3cf6c331dec"),
+}
+HMC_ASSET = HMC_RELEASES[("windows", "x64")][0]
+HMC_DOWNLOAD_URL = f"https://github.com/headlesshq/headlessmc/releases/download/{HMC_VERSION}/{HMC_ASSET}"
+HMC_SHA256 = HMC_RELEASES[("windows", "x64")][1]
 JAVA_VERSION = 17
 JAVA_METADATA_URL = (
     "https://api.adoptium.net/v3/assets/latest/17/hotspot?"
@@ -58,6 +66,38 @@ class LauncherError(RuntimeError):
     pass
 
 
+def host_platform() -> tuple[str, str]:
+    if sys.platform == "win32":
+        return "windows", "x64"
+    if sys.platform == "darwin":
+        machine = __import__("platform").machine().lower()
+        return "macos", "arm64" if machine in {"arm64", "aarch64"} else "x64"
+    if sys.platform.startswith("linux"):
+        machine = __import__("platform").machine().lower()
+        return "linux", "arm64" if machine in {"arm64", "aarch64"} else "x64"
+    raise LauncherError("This launcher currently supports Windows, macOS, and Linux only")
+
+
+def hmc_release() -> tuple[str, str, str]:
+    platform_name, architecture = host_platform()
+    try:
+        asset, checksum = HMC_RELEASES[(platform_name, architecture)]
+    except KeyError as error:
+        raise LauncherError(f"HeadlessMc has no release for {platform_name} {architecture}") from error
+    return asset, checksum, f"https://github.com/headlesshq/headlessmc/releases/download/{HMC_VERSION}/{asset}"
+
+
+def java_metadata_url() -> str:
+    if sys.platform == "win32":
+        return JAVA_METADATA_URL
+    architecture = "aarch64" if __import__("platform").machine().lower() in {"arm64", "aarch64"} else "x64"
+    operating_system = "mac" if sys.platform == "darwin" else "linux"
+    return (
+        "https://api.adoptium.net/v3/assets/latest/17/hotspot?"
+        f"architecture={architecture}&image_type=jre&os={operating_system}&vendor=eclipse"
+    )
+
+
 @dataclass(frozen=True)
 class Release:
     version: str
@@ -74,6 +114,132 @@ class Release:
             raise LauncherError("Invalid modpack version")
         if self.sha256 is not None and not re.fullmatch(r"[0-9a-fA-F]{64}", self.sha256):
             raise LauncherError("Invalid SHA-256 checksum")
+
+
+@dataclass(frozen=True)
+class LauncherRelease:
+    version: str
+    page_url: str
+    asset_url: str | None = None
+    asset_name: str | None = None
+    asset_sha256: str | None = None
+
+    def validate(self) -> None:
+        if not re.fullmatch(r"\d+(?:\.\d+){1,3}", self.version):
+            raise LauncherError("Invalid launcher version")
+        page = urllib.parse.urlparse(self.page_url)
+        if page.scheme != "https" or page.hostname != "github.com":
+            raise LauncherError("The launcher release page must be on github.com")
+        if self.asset_url is not None:
+            asset = urllib.parse.urlparse(self.asset_url)
+            if asset.scheme != "https" or asset.hostname not in {"github.com", "objects.githubusercontent.com"}:
+                raise LauncherError("The launcher update URL uses an unexpected host")
+        if self.asset_sha256 is not None and not re.fullmatch(r"[0-9a-fA-F]{64}", self.asset_sha256):
+            raise LauncherError("Invalid launcher update SHA-256 checksum")
+
+
+def _version_key(version: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in version.split("."))
+
+
+def _launcher_asset(assets: object) -> tuple[str, str, str | None] | None:
+    if not isinstance(assets, list):
+        return None
+    platform_name = "windows" if sys.platform == "win32" else "macos" if sys.platform == "darwin" else "linux"
+    candidates = []
+    for asset in assets:
+        if not isinstance(asset, dict):
+            continue
+        name = str(asset.get("name") or "")
+        url = str(asset.get("browser_download_url") or "")
+        lower = name.lower()
+        if not name or not url or "launcher" not in lower:
+            continue
+        if platform_name == "windows" and not lower.endswith((".exe", ".msi")):
+            continue
+        if platform_name == "macos" and not lower.endswith((".dmg", ".pkg", ".zip")):
+            continue
+        if platform_name == "linux" and not lower.endswith((".appimage", ".tar.gz", ".zip")):
+            continue
+        platform_match = platform_name in lower or (platform_name == "macos" and any(x in lower for x in ("mac", "darwin", "osx")))
+        candidates.append((0 if platform_match else 1, name, url, asset.get("digest")))
+    if not candidates:
+        return None
+    _, name, url, digest = min(candidates)
+    checksum = str(digest)[7:] if isinstance(digest, str) and digest.startswith("sha256:") else None
+    return name, url, checksum
+
+
+def fetch_latest_launcher_release(timeout: int = 12) -> LauncherRelease | None:
+    request = urllib.request.Request(
+        LAUNCHER_RELEASES_API,
+        headers={"User-Agent": f"WibsverseLauncher/{LAUNCHER_VERSION}", "Accept": "application/vnd.github+json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = response.read(2 * 1024 * 1024 + 1)
+    except (OSError, urllib.error.URLError) as error:
+        raise LauncherError(f"Could not check launcher releases: {error}") from error
+    if len(body) > 2 * 1024 * 1024:
+        raise LauncherError("GitHub release response is unexpectedly large")
+    try:
+        releases = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise LauncherError("GitHub returned invalid launcher release data") from error
+    if not isinstance(releases, list):
+        raise LauncherError("GitHub returned unexpected launcher release data")
+    possible: list[LauncherRelease] = []
+    for item in releases:
+        if not isinstance(item, dict) or item.get("draft"):
+            continue
+        match = re.fullmatch(r"v?(\d+(?:\.\d+){1,3})", str(item.get("tag_name") or ""))
+        page_url = str(item.get("html_url") or "")
+        if not match or not page_url:
+            continue
+        asset = _launcher_asset(item.get("assets"))
+        release = LauncherRelease(
+            match.group(1), page_url,
+            asset[1] if asset else None,
+            asset[0] if asset else None,
+            asset[2] if asset else None,
+        )
+        release.validate()
+        possible.append(release)
+    return max(possible, key=lambda release: _version_key(release.version)) if possible else None
+
+
+def download_launcher_asset(release: LauncherRelease) -> Path:
+    if not release.asset_url or not release.asset_name:
+        raise LauncherError("This release has no compatible launcher download")
+    release.validate()
+    safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", Path(release.asset_name).name)
+    destination = Path(tempfile.gettempdir()) / f"WibsverseLauncher-{release.version}-{uuid.uuid4().hex}-{safe_name}"
+    request = urllib.request.Request(release.asset_url, headers={"User-Agent": f"WibsverseLauncher/{LAUNCHER_VERSION}"})
+    digest = hashlib.sha256()
+    total = 0
+    try:
+        with urllib.request.urlopen(request, timeout=90) as response, destination.open("wb") as output:
+            final = urllib.parse.urlparse(response.geturl())
+            if final.scheme != "https" or not (
+                final.hostname in {"github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com"}
+                or (final.hostname or "").endswith(".githubusercontent.com")
+            ):
+                raise LauncherError("Launcher update redirected to an unexpected host")
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > 500 * 1024 * 1024:
+                    raise LauncherError("Launcher update exceeds the size limit")
+                output.write(chunk)
+                digest.update(chunk)
+        if not total or (release.asset_sha256 and digest.hexdigest().lower() != release.asset_sha256.lower()):
+            raise LauncherError("Launcher update SHA-256 does not match the release metadata")
+        return destination
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
 
 
 class DownloadLinks(HTMLParser):
@@ -110,7 +276,7 @@ def parse_official_download_page(html: str) -> Release:
 
 def fetch_latest_release(timeout: int = 18) -> Release:
     request = urllib.request.Request(
-        DOWNLOAD_PAGE, headers={"User-Agent": "WibsverseLauncher/0.1 (+modpack-update-check)", "Accept": "text/html"}
+        DOWNLOAD_PAGE, headers={"User-Agent": f"WibsverseLauncher/{LAUNCHER_VERSION} (+modpack-update-check)", "Accept": "text/html"}
     )
     with urllib.request.urlopen(request, timeout=timeout) as response:
         body = response.read(2 * 1024 * 1024 + 1)
@@ -121,7 +287,12 @@ def fetch_latest_release(timeout: int = 18) -> Release:
 
 
 def app_dir() -> Path:
-    base = os.environ.get("LOCALAPPDATA") or str(Path.home() / ".local" / "share")
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+    elif sys.platform == "darwin":
+        base = str(Path.home() / "Library" / "Application Support")
+    else:
+        base = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
     return Path(base) / "WibsverseLauncher"
 
 
@@ -130,7 +301,8 @@ def headlessmc_root() -> Path:
 
 
 def headlessmc_executable_path(root: Path | None = None) -> Path:
-    return (root or headlessmc_root()) / "bin" / "headlessmc.exe"
+    name = "headlessmc.exe" if sys.platform == "win32" else "headlessmc"
+    return (root or headlessmc_root()) / "bin" / name
 
 
 def instance_dir(root: Path) -> Path:
@@ -186,7 +358,6 @@ def ensure_hmc_config(root: Path, java_home: Path | None = None) -> None:
         "hmc.launcher.auto-download-specifics",
         "hmc.java.check-for-updates",
         "hmc.java.versions",
-        "hmc.java.versions",
     }
     lines = [line for line in existing if not line or line.lstrip().startswith("#")
              or line.split("=", 1)[0].strip() not in keys]
@@ -223,7 +394,7 @@ def ensure_instance(root: Path) -> None:
 
 
 def _limited_urlopen(url: str, allowed_host: str, size_limit: int) -> bytes:
-    request = urllib.request.Request(url, headers={"User-Agent": "WibsverseLauncher/0.3"})
+    request = urllib.request.Request(url, headers={"User-Agent": f"WibsverseLauncher/{LAUNCHER_VERSION}"})
     with urllib.request.urlopen(request, timeout=30) as response:
         final = urllib.parse.urlparse(response.geturl())
         if final.scheme != "https" or final.hostname != allowed_host:
@@ -278,6 +449,29 @@ def find_java_home(root: Path, major: int = JAVA_VERSION) -> Path | None:
         system_java = Path(program_files) / "Java"
         if system_java.is_dir():
             candidates.extend(path for path in sorted(system_java.iterdir()) if path.is_dir())
+    if sys.platform == "darwin":
+        for java_root in (
+            Path("/Library/Java/JavaVirtualMachines"),
+            Path.home() / "Library" / "Java" / "JavaVirtualMachines",
+        ):
+            if java_root.is_dir():
+                for path in sorted(java_root.iterdir()):
+                    if path.is_dir():
+                        candidates.extend((path, path / "Contents" / "Home"))
+        try:
+            result = subprocess.run(
+                ["/usr/libexec/java_home", "-v", str(major)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                timeout=5,
+                check=False,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                candidates.append(Path(result.stdout.strip()))
+        except (OSError, subprocess.TimeoutExpired):
+            pass
     path_java = shutil.which("java")
     if path_java:
         candidates.append(Path(path_java).resolve().parent.parent)
@@ -316,7 +510,7 @@ def _download_verified_file(
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme != "https" or parsed.hostname not in allowed_hosts:
         raise LauncherError("Java download URL uses an unexpected host")
-    request = urllib.request.Request(url, headers={"User-Agent": "WibsverseLauncher/0.3"})
+    request = urllib.request.Request(url, headers={"User-Agent": f"WibsverseLauncher/{LAUNCHER_VERSION}"})
     digest = hashlib.sha256()
     total = 0
     temporary = destination.with_name(destination.name + ".download")
@@ -354,25 +548,50 @@ def _extract_java_archive(archive: Path, destination: Path) -> Path:
     total = 0
     try:
         extracted.mkdir(parents=True)
-        with zipfile.ZipFile(archive) as z:
-            infos = [info for info in z.infolist() if not info.is_dir()]
-            if len(infos) > 10000:
-                raise LauncherError("Java archive has too many entries")
-            for info in infos:
-                rel = _java_archive_path(info.filename)
-                mode = (info.external_attr >> 16) & 0xFFFF
-                if stat.S_ISLNK(mode):
-                    raise LauncherError("Java archive contains a symlink")
-                total += info.file_size
-                if total > MAX_JAVA_UNPACKED_BYTES:
-                    raise LauncherError("Java archive expands beyond the size limit")
-                target = extracted.joinpath(rel)
-                target.parent.mkdir(parents=True, exist_ok=True)
-                with z.open(info) as source, target.open("wb") as output:
-                    shutil.copyfileobj(source, output, 1024 * 1024)
-        homes = sorted({path.parent.parent for path in extracted.rglob("java.exe") if path.parent.name == "bin"})
+        if zipfile.is_zipfile(archive):
+            with zipfile.ZipFile(archive) as z:
+                infos = [info for info in z.infolist() if not info.is_dir()]
+                if len(infos) > 10000:
+                    raise LauncherError("Java archive has too many entries")
+                for info in infos:
+                    rel = _java_archive_path(info.filename)
+                    mode = (info.external_attr >> 16) & 0xFFFF
+                    if stat.S_ISLNK(mode):
+                        raise LauncherError("Java archive contains a symlink")
+                    total += info.file_size
+                    if total > MAX_JAVA_UNPACKED_BYTES:
+                        raise LauncherError("Java archive expands beyond the size limit")
+                    target = extracted.joinpath(rel)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with z.open(info) as source, target.open("wb") as output:
+                        shutil.copyfileobj(source, output, 1024 * 1024)
+        else:
+            with tarfile.open(archive, "r:gz") as tar:
+                members = [member for member in tar.getmembers() if member.isfile()]
+                if len(members) > 10000:
+                    raise LauncherError("Java archive has too many entries")
+                for member in members:
+                    rel = _java_archive_path(member.name)
+                    if member.issym() or member.islnk():
+                        raise LauncherError("Java archive contains a symlink")
+                    total += member.size
+                    if total > MAX_JAVA_UNPACKED_BYTES:
+                        raise LauncherError("Java archive expands beyond the size limit")
+                    source = tar.extractfile(member)
+                    if source is None:
+                        raise LauncherError("Java archive contains an unreadable file")
+                    target = extracted.joinpath(rel)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with source, target.open("wb") as output:
+                        shutil.copyfileobj(source, output, 1024 * 1024)
+                    if target.parent.name == "bin":
+                        target.chmod(target.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        homes = sorted({
+            path.parent.parent for path in extracted.rglob("*")
+            if path.is_file() and path.name in {"java", "java.exe"} and path.parent.name == "bin"
+        })
         if not homes:
-            raise LauncherError("Java 17 archive does not contain bin\\java.exe")
+            raise LauncherError("Java 17 archive does not contain bin/java")
         home = homes[0]
         if destination.exists():
             raise LauncherError("A managed Java 17 installation already exists")
@@ -396,7 +615,7 @@ def ensure_java17(root: Path, progress: Progress = lambda *_: None) -> Path:
 
     progress("Java 17 was not found. Downloading a private Temurin runtime...", 0)
     try:
-        metadata = json.loads(_limited_urlopen(JAVA_METADATA_URL, "api.adoptium.net", MAX_JAVA_METADATA_BYTES))
+        metadata = json.loads(_limited_urlopen(java_metadata_url(), "api.adoptium.net", MAX_JAVA_METADATA_BYTES))
         entry = next(
             item for item in metadata if isinstance(item, dict)
             and isinstance(item.get("binary"), dict)
@@ -410,7 +629,8 @@ def ensure_java17(root: Path, progress: Progress = lambda *_: None) -> Path:
         java_dir = hmc_data_dir(root) / "java"
         java_dir.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="wibsverse-java-", dir=str(root)) as temporary:
-            archive = Path(temporary) / "java17.zip"
+            archive_name = "java17.tar.gz" if url.lower().split("?", 1)[0].endswith((".tar.gz", ".tgz")) else "java17.zip"
+            archive = Path(temporary) / archive_name
             _download_verified_file(
                 url, archive, ("github.com", "api.adoptium.net"), MAX_JAVA_DOWNLOAD_BYTES, checksum,
                 lambda message, value: progress(message, value),
@@ -421,8 +641,8 @@ def ensure_java17(root: Path, progress: Progress = lambda *_: None) -> Path:
         ensure_hmc_config(root)
         progress("Java 17 is ready", 100)
         return home
-    except (OSError, ValueError, TypeError, KeyError, StopIteration, json.JSONDecodeError, zipfile.BadZipFile,
-            urllib.error.URLError) as error:
+    except (OSError, ValueError, TypeError, KeyError, StopIteration, json.JSONDecodeError,
+            zipfile.BadZipFile, tarfile.ReadError, urllib.error.URLError) as error:
         raise LauncherError(f"Could not install Java 17: {error}") from error
 
 
@@ -454,7 +674,7 @@ def _sha(path: Path) -> str:
 
 def _download_archive(release: Release, destination: Path, progress: Progress) -> str:
     release.validate()
-    req = urllib.request.Request(release.url, headers={"User-Agent": "WibsverseLauncher/0.1"})
+    req = urllib.request.Request(release.url, headers={"User-Agent": f"WibsverseLauncher/{LAUNCHER_VERSION}"})
     digest = hashlib.sha256()
     total = 0
     with urllib.request.urlopen(req, timeout=45) as response, destination.open("wb") as dst:
@@ -629,26 +849,35 @@ def install_release(root: Path, release: Release, progress: Progress = lambda *_
 
 
 def find_headlessmc() -> str | None:
-    paths = [
-        shutil.which("headlessmc"),
-        shutil.which("headlessmc.exe"),
-        os.path.join(os.environ.get("LOCALAPPDATA", ""), "headlessmc", "bin", "headlessmc.exe"),
-        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "headlessmc", "headlessmc.exe"),
-        os.path.join(os.environ.get("ProgramFiles", ""), "HeadlessMc", "headlessmc.exe"),
-        str(headlessmc_executable_path()),
-        str(app_dir() / "headlessmc.exe"),
-    ]
+    executable_name = "headlessmc.exe" if sys.platform == "win32" else "headlessmc"
+    paths = [shutil.which(executable_name), str(headlessmc_executable_path())]
+    if sys.platform == "win32":
+        paths.extend([
+            os.path.join(os.environ.get("LOCALAPPDATA", ""), "headlessmc", "bin", executable_name),
+            os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "headlessmc", executable_name),
+            os.path.join(os.environ.get("ProgramFiles", ""), "HeadlessMc", executable_name),
+        ])
+    else:
+        paths.extend([
+            str(Path.home() / ".headlessmc" / "bin" / executable_name),
+            str(Path("/usr/local/bin") / executable_name),
+            str(Path("/opt/homebrew/bin") / executable_name),
+        ])
     return next((str(Path(p)) for p in paths if p and Path(p).is_file()), None)
 
 
 def install_headlessmc(root: Path, progress: Progress = lambda *_: None) -> Path:
-    """Download the pinned official Windows binary into the launcher data directory."""
+    """Download the pinned official platform binary into the launcher data directory."""
     destination = headlessmc_executable_path(root)
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(destination.name + ".download")
+    if sys.platform == "win32":
+        download_url, expected_checksum = HMC_DOWNLOAD_URL, HMC_SHA256
+    else:
+        _asset, expected_checksum, download_url = hmc_release()
     request = urllib.request.Request(
-        HMC_DOWNLOAD_URL,
-        headers={"User-Agent": "WibsverseLauncher/0.3", "Accept": "application/octet-stream"},
+        download_url,
+        headers={"User-Agent": f"WibsverseLauncher/{LAUNCHER_VERSION}", "Accept": "application/octet-stream"},
     )
     digest = hashlib.sha256()
     total = 0
@@ -675,9 +904,11 @@ def install_headlessmc(root: Path, progress: Progress = lambda *_: None) -> Path
                 progress("Downloading HeadlessMc...", min(90, total * 90 // max(expected, total)))
         if total == 0:
             raise LauncherError("HeadlessMc download was empty")
-        if digest.hexdigest().lower() != HMC_SHA256:
+        if digest.hexdigest().lower() != expected_checksum:
             raise LauncherError("HeadlessMc download SHA-256 does not match the pinned release")
         os.replace(temporary, destination)
+        if sys.platform != "win32":
+            destination.chmod(destination.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
         progress(f"HeadlessMc {HMC_VERSION} installed", 100)
         return destination
     except (OSError, urllib.error.URLError, TimeoutError) as error:

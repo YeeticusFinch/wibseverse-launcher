@@ -16,6 +16,30 @@ URL = "https://cdn.wibsverse.com/modpacks/ds/manual/20261029-2.3.0/WibsDemonSlay
 
 
 class LauncherCoreTests(unittest.TestCase):
+    def test_latest_launcher_release_uses_newest_non_draft_tag(self):
+        payload = json.dumps([
+            {"tag_name": "0.3", "draft": False, "html_url": "https://github.com/YeeticusFinch/wibseverse-launcher/releases/tag/0.3", "assets": [
+                {"name": "WibsverseLauncherAutoInstall.exe", "browser_download_url": "https://github.com/YeeticusFinch/wibseverse-launcher/releases/download/0.3/WibsverseLauncherAutoInstall.exe", "digest": "sha256:" + "a" * 64},
+            ]},
+            {"tag_name": "0.9", "draft": True, "html_url": "https://github.com/YeeticusFinch/wibseverse-launcher/releases/tag/0.9", "assets": []},
+            {"tag_name": "0.2", "draft": False, "html_url": "https://github.com/YeeticusFinch/wibseverse-launcher/releases/tag/0.2", "assets": []},
+        ]).encode()
+
+        class Response(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                self.close()
+
+        with patch.object(core.urllib.request, "urlopen", return_value=Response(payload)):
+            release = core.fetch_latest_launcher_release()
+        self.assertIsNotNone(release)
+        assert release is not None
+        self.assertEqual(release.version, "0.3")
+        self.assertEqual(release.asset_name, "WibsverseLauncherAutoInstall.exe")
+        self.assertEqual(release.asset_sha256, "a" * 64)
+
     def test_official_download_parser(self):
         html = f'<a href="{URL}">Download Mods ZIP</a>'
         release = core.parse_official_download_page(html)

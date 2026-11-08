@@ -21,13 +21,14 @@ from PySide6.QtWidgets import (
 )
 
 from core import (
-    FORGE_VERSION, MINECRAFT_VERSION, LauncherError, Release, app_dir, atomic_json, ensure_instance,
+    FORGE_VERSION, LAUNCHER_VERSION, MINECRAFT_VERSION, LauncherError, LauncherRelease, Release, app_dir, atomic_json, ensure_instance,
     fetch_latest_release, find_headlessmc, game_dir, hmc_accounts, install_release,
     hmc_environment, hmc_launch_command, hmc_login_command,
     hmc_profile_command, hmc_remove_account_command,
     hmc_profile_is_pinned, hmc_select_account_command, legacy_prism_data_dir,
     create_hmc_offline_account, ensure_java17, install_headlessmc, load_json,
-    migrate_legacy_instance, read_installed, run_hmc,
+    migrate_legacy_instance, read_installed, run_hmc, fetch_latest_launcher_release,
+    download_launcher_asset,
 )
 from skinutils import skin_png_for_uuid
 
@@ -66,6 +67,8 @@ def native_icon_file(source: Path, filename: str) -> Path | None:
 
 
 def game_icon_file() -> Path | None:
+    if os.name != "nt":
+        return None
     return native_icon_file(game_icon_asset(), "wibsverse_game.ico")
 
 
@@ -171,6 +174,32 @@ class UpdateWorker(QThread):
             self.failed.emit(f"{type(error).__name__}: {error}")
 
 
+class LauncherUpdateWorker(QThread):
+    succeeded = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, release: LauncherRelease):
+        super().__init__()
+        self.release = release
+
+    def run(self):
+        try:
+            self.succeeded.emit(download_launcher_asset(self.release))
+        except Exception as error:
+            self.failed.emit(f"{type(error).__name__}: {error}")
+
+
+class LauncherReleaseWorker(QThread):
+    succeeded = Signal(object)
+    failed = Signal(str)
+
+    def run(self):
+        try:
+            self.succeeded.emit(fetch_latest_launcher_release())
+        except Exception as error:
+            self.failed.emit(f"{type(error).__name__}: {error}")
+
+
 class MigrationWorker(QThread):
     progressed = Signal(str, int)
     succeeded = Signal()
@@ -209,7 +238,7 @@ class LoginWorker(QThread):
         try:
             ensure_instance(self.root)
             if not self.executable or not Path(self.executable).is_file():
-                self.progressed.emit("HeadlessMc was not found. Installing the official Windows release...")
+                self.progressed.emit("HeadlessMc was not found. Installing the official release...")
                 self.executable = str(install_headlessmc(
                     self.root, lambda message, _percentage: self.progressed.emit(message)
                 ))
@@ -269,7 +298,7 @@ class OfflineLoginWorker(QThread):
         try:
             ensure_instance(self.root)
             if not self.executable or not Path(self.executable).is_file():
-                self.progressed.emit("HeadlessMc was not found. Installing the official Windows release...")
+                self.progressed.emit("HeadlessMc was not found. Installing the official release...")
                 self.executable = str(install_headlessmc(
                     self.root, lambda message, _percentage: self.progressed.emit(message)
                 ))
@@ -329,7 +358,7 @@ class LaunchWorker(QThread):
         try:
             ensure_instance(self.root)
             if not self.executable or not Path(self.executable).is_file():
-                self.progressed.emit("HeadlessMc was not found. Installing the official Windows release...")
+                self.progressed.emit("HeadlessMc was not found. Installing the official release...")
                 self.executable = str(install_headlessmc(self.root, lambda message, _percentage: self.progressed.emit(message)))
                 self.executable_ready.emit(self.executable)
             ensure_java17(self.root, lambda message, _percentage: self.progressed.emit(message))
@@ -538,6 +567,10 @@ class Launcher(QWidget):
             self.selection = {}
         self.release: Release | None = None
         self.task: UpdateWorker | None = None
+        self.launcher_release: LauncherRelease | None = None
+        self.launcher_release_task: LauncherReleaseWorker | None = None
+        self.launcher_download_task: LauncherUpdateWorker | None = None
+        self._launcher_update_prompted = False
         self.migration_task: MigrationWorker | None = None
         self.login_task: LoginWorker | None = None
         self.offline_task: OfflineLoginWorker | None = None
@@ -733,6 +766,7 @@ class Launcher(QWidget):
         self.settings_menu = QMenu(self)
         for label, callback in (
             ("Check for Updates", self.check_updates),
+            ("Check for Launcher Updates", self.check_launcher_updates),
             ("Set HeadlessMc Path...", self.select_hmc),
             ("Game Files", self.open_folder),
         ):
@@ -921,6 +955,7 @@ class Launcher(QWidget):
         self._persist()
         self._refresh_accounts()
         self.update_installed_label()
+        self.check_launcher_updates()
         self.check_updates()
 
     def _persist(self):
@@ -1198,6 +1233,80 @@ class Launcher(QWidget):
         self.status.setText("Checking for modpack updates...")
         self._worker("check")
 
+    def check_launcher_updates(self):
+        if self.launcher_release_task is not None or self.launcher_download_task is not None:
+            return
+        self.launcher_release_task = LauncherReleaseWorker()
+        self.launcher_release_task.succeeded.connect(self._launcher_release_checked)
+        self.launcher_release_task.failed.connect(self._launcher_release_failed)
+        self.launcher_release_task.finished.connect(self._launcher_release_finished)
+        self.launcher_release_task.start()
+
+    def _launcher_release_checked(self, result: object):
+        if not isinstance(result, LauncherRelease):
+            return
+        self.launcher_release = result
+        current = tuple(int(part) for part in LAUNCHER_VERSION.split("."))
+        latest = tuple(int(part) for part in result.version.split("."))
+        if latest <= current:
+            return
+        if self._launcher_update_prompted:
+            return
+        self._launcher_update_prompted = True
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("Launcher update available")
+        dialog.setText(f"Wibsverse Launcher {result.version} is available.")
+        dialog.setInformativeText(f"You are running version {LAUNCHER_VERSION}. Update now to get the latest launcher.")
+        update = dialog.addButton("Update Launcher", QMessageBox.ButtonRole.AcceptRole)
+        dialog.addButton("Later", QMessageBox.ButtonRole.RejectRole)
+        dialog.exec()
+        if dialog.clickedButton() is update:
+            self._update_launcher(result)
+
+    def _launcher_release_failed(self, message: str):
+        self.status.setText("Launcher update check failed: " + message)
+
+    def _launcher_release_finished(self):
+        self.launcher_release_task = None
+
+    def _update_launcher(self, release: LauncherRelease):
+        if not release.asset_url:
+            QDesktopServices.openUrl(QUrl(release.page_url))
+            self.status.setText("Opening the launcher release page. Download the compatible installer there.")
+            return
+        self.status.setText(f"Downloading Wibsverse Launcher {release.version}...")
+        self.launcher_download_task = LauncherUpdateWorker(release)
+        self.launcher_download_task.succeeded.connect(self._launcher_downloaded)
+        self.launcher_download_task.failed.connect(self._launcher_download_failed)
+        self.launcher_download_task.finished.connect(self._launcher_download_finished)
+        self.launcher_download_task.start()
+
+    def _launcher_downloaded(self, path: object):
+        if not isinstance(path, Path):
+            self._launcher_download_failed("The downloaded launcher file was invalid")
+            return
+        try:
+            if os.name == "nt":
+                os.startfile(str(path))
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(path)])
+            else:
+                subprocess.Popen(["xdg-open", str(path)])
+        except OSError as error:
+            self._launcher_download_failed(f"Could not open the launcher update: {error}")
+            return
+        self.status.setText("Launcher update opened. Closing this launcher...")
+        application = QApplication.instance()
+        if application is not None:
+            QTimer.singleShot(250, application.quit)
+
+    def _launcher_download_failed(self, message: str):
+        self.status.setText("Launcher update failed: " + message)
+        QMessageBox.warning(self, "Launcher update failed", message)
+
+    def _launcher_download_finished(self):
+        self.launcher_download_task = None
+
     def _completed(self, operation: str, result: object):
         if operation == "check":
             if not isinstance(result, Release):
@@ -1242,7 +1351,7 @@ class Launcher(QWidget):
             QTimer.singleShot(0, lambda: self._worker("install", release))
 
     def select_hmc(self):
-        file, _ = QFileDialog.getOpenFileName(self, "Select HeadlessMc executable", "", "Executables (*.exe);;All files (*)")
+        file, _ = QFileDialog.getOpenFileName(self, "Select HeadlessMc executable", "", "All files (*)")
         if file:
             self.hmc_exe = file
             self._refresh_accounts()
@@ -1252,7 +1361,7 @@ class Launcher(QWidget):
         if not self.hmc_exe or not Path(self.hmc_exe).is_file():
             QMessageBox.warning(
                 self, "HeadlessMc not found",
-                "Install HeadlessMc and select headlessmc.exe via Settings → Set HeadlessMc Path.\n"
+                "Install HeadlessMc and select its executable via Settings → Set HeadlessMc Path.\n"
                 "https://headlesshq.github.io/headlessmc/",
             )
             return False
@@ -1316,7 +1425,8 @@ class Launcher(QWidget):
     def closeEvent(self, event):
         if (self.task is not None or self.migration_task is not None
                 or self.login_task is not None or self.offline_task is not None
-                or self.remove_account_task is not None or self.launch_task is not None):
+                or self.remove_account_task is not None or self.launch_task is not None
+                or self.launcher_download_task is not None):
             event.ignore()
             QMessageBox.information(self, "Updating", "Please keep the launcher open until the current operation finishes.")
             return
