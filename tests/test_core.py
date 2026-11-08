@@ -1,4 +1,5 @@
 import hashlib
+import io
 import json
 import os
 import sys
@@ -39,7 +40,7 @@ class LauncherCoreTests(unittest.TestCase):
     def test_install_and_update_does_not_delete_save(self):
         with tempfile.TemporaryDirectory() as temp:
             base = Path(temp)
-            root = base / "PrismData"
+            root = base / "HeadlessMc"
             os.environ["LOCALAPPDATA"] = str(base)
             z1 = base / "pack1.zip"
             z2 = base / "pack2.zip"
@@ -75,21 +76,97 @@ class LauncherCoreTests(unittest.TestCase):
             self.assertTrue((game / "mods" / "personal.jar").exists())
             self.assertEqual((game / "config" / "a.cfg").read_bytes(), b"version2")
             self.assertEqual((game / "saves" / "myworld" / "level.dat").read_bytes(), b"my save")
-            mmc = json.loads((core.instance_dir(root) / "mmc-pack.json").read_text())
-            self.assertEqual(mmc["components"][1]["version"], "47.4.23")
+            state = json.loads((root / "wibsverse-installed.json").read_text())
+            self.assertEqual(state["version"], "2.3.1")
+            config = (root / "config" / "headlessmc" / "config.properties").read_text()
+            self.assertIn("hmc.files.game=", config)
+            self.assertIn("hmc.files.game-for-each-version=false", config)
+            self.assertIn("hmc.java.download=false", config)
+            self.assertNotIn("hmc.java.check-for-updates", config)
+            self.assertNotIn("hmc.launcher.auto-download-specifics", config)
 
-    def test_accounts_and_command(self):
+    def test_hmc_commands_pin_forge_and_launch_headlessly(self):
+        root = Path("C:/Wibsverse/HeadlessMc")
+        self.assertEqual(core.hmc_login_command("hmc"), ["hmc", "account", "--provider", "default", "login"])
+        self.assertEqual(core.hmc_account_list_command("hmc"), ["hmc", "account", "list"])
+        self.assertEqual(core.hmc_offline_login_command("hmc"), ["hmc", "account", "--provider", "offline", "login"])
+        self.assertEqual(core.hmc_select_account_command("hmc", "Player_123")[-2:], ["select", "Player_123"])
+        self.assertEqual(core.hmc_remove_account_command("hmc", "Player_123")[-2:], ["remove", "Player_123"])
+        self.assertEqual(
+            core.hmc_profile_command("hmc", root),
+            ["hmc", "profile", "add", "forge", "1.20.1", "47.4.23", "--force", "--name", "wibsverse", "--dir", str(core.game_dir(root))],
+        )
+        command = core.hmc_launch_command("hmc", "Player_123")
+        self.assertEqual(command[:2], ["hmc", "launch"])
+        self.assertNotIn("--headless", command)
+        self.assertIn("--server", command)
+        self.assertEqual(command[-1], "wibsverse")
+
+    def test_hmc_account_table_exposes_public_microsoft_metadata_only(self):
+        output = (
+            "name         uuid                                  type  provider\n"
+            "Player_123   853c80ef-3c37-49fd-aa49-938b674adae6  msa   default\n"
+            "Steve        00000000000000000000000000000000      offline offline\n"
+        )
+        accounts = core.parse_hmc_accounts(output)
+        self.assertEqual(accounts[0]["name"], "Player_123")
+        self.assertEqual(accounts[0]["uuid"], "853c80ef3c3749fdaa49938b674adae6")
+        offline = core.parse_hmc_accounts(
+            "\x1b[1mOfflineUser\x1b[0m  146cd464-990f-45e9-a94c-706442ec758c  msa  offline\n"
+        )
+        self.assertEqual(offline[0]["mode"], "offline")
+        self.assertEqual(len(accounts), 1)
+
+    def test_hmc_profile_pin_check(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            (root / "accounts.json").write_text(json.dumps({"accounts": [
-                {"type": "MSA", "profile": {"name": "Player_123"}, "accessToken": "never_show"}
-            ]}))
-            accounts = core.prism_accounts(root)
-            self.assertEqual(accounts, [{"name": "Player_123", "type": "MSA"}])
-            cmd = core.prism_launch_command("prism", root, online_name="Player_123")
-            self.assertIn("--profile", cmd)
-            self.assertIn("play.wibsverse.com", cmd)
-            self.assertNotIn("never_show", str(accounts))
+            profile = core.hmc_profile_path(root)
+            profile.parent.mkdir(parents=True)
+            profile.write_text(json.dumps({"currentVersion": {
+                "platform": "forge", "version": "1.20.1", "build": "47.4.23"
+            }}))
+            self.assertTrue(core.hmc_profile_is_pinned(root))
+            profile.write_text(json.dumps({"currentVersion": {
+                "platform": "forge", "version": "1.20.1", "build": "47.4.24"
+            }}))
+            self.assertFalse(core.hmc_profile_is_pinned(root))
+
+    def test_create_hmc_offline_account_writes_tokenless_record(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            account = core.create_hmc_offline_account(root, "LocalPlayer")
+            self.assertEqual(account["provider"], "offline")
+            self.assertEqual(account["token"], "")
+            stored = json.loads(core.hmc_offline_accounts_path(root).read_text())
+            self.assertEqual(stored["version"], 0)
+            self.assertEqual(stored["accounts"]["LocalPlayer"]["name"], "LocalPlayer")
+            with self.assertRaises(core.LauncherError):
+                core.create_hmc_offline_account(root, "localplayer")
+
+    def test_install_headlessmc_verifies_and_replaces_binary_atomically(self):
+        self.assertRegex(core.HMC_SHA256, r"^[0-9a-f]{64}$")
+        payload = b"fake-headlessmc-binary"
+
+        class Response(io.BytesIO):
+            headers = {"Content-Length": str(len(payload))}
+
+            def geturl(self):
+                return core.HMC_DOWNLOAD_URL
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                self.close()
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            with patch.object(core.urllib.request, "urlopen", return_value=Response(payload)):
+                with patch.object(core, "HMC_SHA256", hashlib.sha256(payload).hexdigest()):
+                    executable = core.install_headlessmc(root)
+            self.assertEqual(executable, core.headlessmc_executable_path(root))
+            self.assertEqual(executable.read_bytes(), payload)
+            self.assertFalse(executable.with_name("headlessmc.exe.download").exists())
 
 
 if __name__ == "__main__":

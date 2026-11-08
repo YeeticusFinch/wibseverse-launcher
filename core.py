@@ -1,4 +1,4 @@
-"""Wibsverse Launcher: Prism instance and safe modpack updater (Python 3.10+)."""
+"""Wibsverse Launcher: HeadlessMc integration and safe modpack updater."""
 from __future__ import annotations
 
 import hashlib
@@ -10,6 +10,7 @@ import stat
 import subprocess
 import tempfile
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -24,6 +25,24 @@ SERVER = "play.wibsverse.com"
 MINECRAFT_VERSION = "1.20.1"
 FORGE_VERSION = "47.4.23"
 INSTANCE_ID = "wibsverse-demon-slayer"
+HMC_PROFILE_NAME = "wibsverse"
+HMC_ROOT_NAME = "HeadlessMc"
+HMC_VERSION = "3.0.0-RC8"
+HMC_ASSET = "headlessmc-launcher-windows-x64.exe"
+HMC_DOWNLOAD_URL = (
+    "https://github.com/headlesshq/headlessmc/releases/download/"
+    f"{HMC_VERSION}/{HMC_ASSET}"
+)
+HMC_SHA256 = "72c42ddd7240f08c79615bbf5e9bef15d209d3e75017f4ef9d9dde9f5028f935"
+JAVA_VERSION = 17
+JAVA_METADATA_URL = (
+    "https://api.adoptium.net/v3/assets/latest/17/hotspot?"
+    "architecture=x64&image_type=jre&os=windows&vendor=eclipse"
+)
+MAX_JAVA_METADATA_BYTES = 1 * 1024 * 1024
+MAX_JAVA_DOWNLOAD_BYTES = 150 * 1024 * 1024
+MAX_JAVA_UNPACKED_BYTES = 600 * 1024 * 1024
+MAX_HMC_DOWNLOAD_BYTES = 150 * 1024 * 1024
 MAX_ARCHIVE_BYTES = 4 * 1024**3
 MAX_UNPACKED_BYTES = 8 * 1024**3
 ALLOWED_DIRS = {
@@ -106,16 +125,73 @@ def app_dir() -> Path:
     return Path(base) / "WibsverseLauncher"
 
 
-def prism_data_dir() -> Path:
-    return app_dir() / "PrismData"
+def headlessmc_root() -> Path:
+    return app_dir() / HMC_ROOT_NAME
+
+
+def headlessmc_executable_path(root: Path | None = None) -> Path:
+    return (root or headlessmc_root()) / "bin" / "headlessmc.exe"
 
 
 def instance_dir(root: Path) -> Path:
-    return root / "instances" / INSTANCE_ID
+    """Return the wrapper-owned HMC installation root."""
+    return root
 
 
 def game_dir(root: Path) -> Path:
-    return instance_dir(root) / ".minecraft"
+    return root / "game"
+
+
+def hmc_data_dir(root: Path) -> Path:
+    return root / "data" / "headlessmc"
+
+
+def hmc_config_file(root: Path) -> Path:
+    return root / "config" / "headlessmc" / "config.properties"
+
+
+def hmc_environment(root: Path) -> dict[str, str]:
+    """Give HMC isolated XDG directories, including on Windows."""
+    env = os.environ.copy()
+    env.update({
+        "XDG_DATA_HOME": str(root / "data"),
+        "XDG_CONFIG_HOME": str(root / "config"),
+        "XDG_STATE_HOME": str(root / "state"),
+        "XDG_CACHE_HOME": str(root / "cache"),
+    })
+    return env
+
+
+def _hmc_path_value(path: Path) -> str:
+    # Java properties treat backslashes as escapes. Forward slashes are valid on Windows.
+    return str(path.resolve()).replace("\\", "/")
+
+
+def ensure_hmc_config(root: Path, java_home: Path | None = None) -> None:
+    """Configure HMC without changing the user's normal HeadlessMc installation."""
+    path = hmc_config_file(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    required = {
+        "hmc.files.mc": _hmc_path_value(root / "minecraft"),
+        "hmc.files.game": _hmc_path_value(game_dir(root)),
+        "hmc.files.game-for-each-version": "false",
+        "hmc.jline.enabled": "false",
+        "hmc.java.download": "false",
+        "hmc.updater.enabled": "false",
+    }
+    if java_home is not None:
+        required["hmc.java.versions"] = _hmc_path_value(java_home)
+    existing = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    keys = set(required) | {
+        "hmc.launcher.auto-download-specifics",
+        "hmc.java.check-for-updates",
+        "hmc.java.versions",
+        "hmc.java.versions",
+    }
+    lines = [line for line in existing if not line or line.lstrip().startswith("#")
+             or line.split("=", 1)[0].strip() not in keys]
+    lines.extend(f"{key}={value}" for key, value in required.items())
+    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
 
 def load_json(path: Path, default: object) -> object:
@@ -136,40 +212,218 @@ def atomic_json(path: Path, value: object) -> None:
 
 
 def read_installed(root: Path) -> dict:
-    data = load_json(instance_dir(root) / "wibsverse-installed.json", {})
+    data = load_json(root / "wibsverse-installed.json", {})
     return data if isinstance(data, dict) else {}
 
 
 def ensure_instance(root: Path) -> None:
-    folder = instance_dir(root)
-    folder.mkdir(parents=True, exist_ok=True)
-    (folder / ".minecraft").mkdir(exist_ok=True)
-    cfg = folder / "instance.cfg"
-    pack = folder / "mmc-pack.json"
-    if not cfg.exists():
-        cfg.write_text(
-            "InstanceType=OneSix\nname=Wib's Demon Slayer\n"
-            "OverrideMemory=true\nMinMemAlloc=2048\nMaxMemAlloc=6144\n",
+    root.mkdir(parents=True, exist_ok=True)
+    game_dir(root).mkdir(parents=True, exist_ok=True)
+    ensure_hmc_config(root)
+
+
+def _limited_urlopen(url: str, allowed_host: str, size_limit: int) -> bytes:
+    request = urllib.request.Request(url, headers={"User-Agent": "WibsverseLauncher/0.3"})
+    with urllib.request.urlopen(request, timeout=30) as response:
+        final = urllib.parse.urlparse(response.geturl())
+        if final.scheme != "https" or final.hostname != allowed_host:
+            raise LauncherError("Unexpected redirect while downloading setup metadata")
+        content = response.read(size_limit + 1)
+    if len(content) > size_limit:
+        raise LauncherError("Setup metadata response is too large")
+    return content
+
+
+def _java_executable(home: Path) -> Path | None:
+    for name in ("java.exe", "java"):
+        executable = home / "bin" / name
+        if executable.is_file():
+            return executable
+    return None
+
+
+def _java_major(home: Path) -> int | None:
+    executable = _java_executable(home)
+    if executable is None:
+        return None
+    try:
+        result = subprocess.run(
+            [str(executable), "-version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
             encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            check=False,
+            creationflags=_creationflags(),
         )
-    if not pack.exists():
-        atomic_json(pack, {
-            "formatVersion": 1,
-            "components": [
-                {"uid": "net.minecraft", "version": MINECRAFT_VERSION, "important": True},
-                {"uid": "net.minecraftforge", "version": FORGE_VERSION},
-            ],
-        })
-    else:
-        # Don't overwrite user/customized Prism instance version settings.
-        current = load_json(pack, {})
-        components = current.get("components", []) if isinstance(current, dict) else []
-        versions = {c.get("uid"): c.get("version") for c in components if isinstance(c, dict)}
-        if versions.get("net.minecraft") != MINECRAFT_VERSION or versions.get("net.minecraftforge") != FORGE_VERSION:
-            raise LauncherError(
-                f"Instance's Minecraft/Forge versions differ from {MINECRAFT_VERSION}/{FORGE_VERSION}. "
-                "Correct them in Prism before continuing."
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    match = re.search(r'(?:version\s+|openjdk\s+)["\']?(\d+)', result.stdout or "", re.I)
+    return int(match.group(1)) if match else None
+
+
+def find_java_home(root: Path, major: int = JAVA_VERSION) -> Path | None:
+    """Find a Java home HMC can use, preferring the isolated launcher runtime."""
+    candidates: list[Path] = []
+    java_dir = hmc_data_dir(root) / "java"
+    if java_dir.is_dir():
+        candidates.extend(path for path in sorted(java_dir.iterdir()) if path.is_dir())
+    java_home = os.environ.get("JAVA_HOME")
+    if java_home:
+        candidates.append(Path(java_home))
+    program_files = os.environ.get("ProgramFiles")
+    if program_files:
+        system_java = Path(program_files) / "Java"
+        if system_java.is_dir():
+            candidates.extend(path for path in sorted(system_java.iterdir()) if path.is_dir())
+    path_java = shutil.which("java")
+    if path_java:
+        candidates.append(Path(path_java).resolve().parent.parent)
+    seen: set[Path] = set()
+    for candidate in candidates:
+        try:
+            candidate = candidate.resolve()
+        except OSError:
+            continue
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if _java_major(candidate) == major:
+            return candidate
+    return None
+
+
+def _java_archive_path(name: str) -> Path:
+    name = name.replace("\\", "/")
+    if name.startswith("/") or re.match(r"^[A-Za-z]:", name):
+        raise LauncherError(f"Unsafe Java archive path: {name}")
+    parts = [part for part in name.split("/") if part not in ("", ".")]
+    if not parts or ".." in parts or any("\x00" in part or ":" in part for part in parts):
+        raise LauncherError(f"Unsafe Java archive path: {name}")
+    return Path(*parts)
+
+
+def _download_verified_file(
+    url: str,
+    destination: Path,
+    allowed_hosts: tuple[str, ...],
+    maximum: int,
+    expected_sha256: str,
+    progress: Progress = lambda *_: None,
+) -> None:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme != "https" or parsed.hostname not in allowed_hosts:
+        raise LauncherError("Java download URL uses an unexpected host")
+    request = urllib.request.Request(url, headers={"User-Agent": "WibsverseLauncher/0.3"})
+    digest = hashlib.sha256()
+    total = 0
+    temporary = destination.with_name(destination.name + ".download")
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response, temporary.open("wb") as target:
+            final = urllib.parse.urlparse(response.geturl())
+            final_host = final.hostname or ""
+            if final.scheme != "https" or not (
+                final_host in allowed_hosts or final_host.endswith(".githubusercontent.com")
+            ):
+                raise LauncherError("Java download redirected to an unexpected host")
+            expected_size = int(response.headers.get("Content-Length", 0))
+            if expected_size > maximum:
+                raise LauncherError("Java download exceeds the size limit")
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > maximum:
+                    raise LauncherError("Java download exceeds the size limit")
+                target.write(chunk)
+                digest.update(chunk)
+                progress("Downloading Java 17...", min(90, total * 90 // max(expected_size, total)))
+        if total == 0 or digest.hexdigest().lower() != expected_sha256.lower():
+            raise LauncherError("Java 17 download SHA-256 does not match the release metadata")
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _extract_java_archive(archive: Path, destination: Path) -> Path:
+    stage = destination.parent / (".java-stage-" + uuid.uuid4().hex)
+    extracted = stage / "extracted"
+    total = 0
+    try:
+        extracted.mkdir(parents=True)
+        with zipfile.ZipFile(archive) as z:
+            infos = [info for info in z.infolist() if not info.is_dir()]
+            if len(infos) > 10000:
+                raise LauncherError("Java archive has too many entries")
+            for info in infos:
+                rel = _java_archive_path(info.filename)
+                mode = (info.external_attr >> 16) & 0xFFFF
+                if stat.S_ISLNK(mode):
+                    raise LauncherError("Java archive contains a symlink")
+                total += info.file_size
+                if total > MAX_JAVA_UNPACKED_BYTES:
+                    raise LauncherError("Java archive expands beyond the size limit")
+                target = extracted.joinpath(rel)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with z.open(info) as source, target.open("wb") as output:
+                    shutil.copyfileobj(source, output, 1024 * 1024)
+        homes = sorted({path.parent.parent for path in extracted.rglob("java.exe") if path.parent.name == "bin"})
+        if not homes:
+            raise LauncherError("Java 17 archive does not contain bin\\java.exe")
+        home = homes[0]
+        if destination.exists():
+            raise LauncherError("A managed Java 17 installation already exists")
+        os.replace(home, destination)
+        return destination
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+
+
+def ensure_java17(root: Path, progress: Progress = lambda *_: None) -> Path:
+    """Ensure an isolated Java 17 runtime exists and is selected by HMC."""
+    ensure_instance(root)
+    existing = find_java_home(root)
+    if existing is not None:
+        managed_root = hmc_data_dir(root) / "java"
+        if managed_root not in existing.parents:
+            ensure_hmc_config(root, existing)
+        else:
+            ensure_hmc_config(root)
+        return existing
+
+    progress("Java 17 was not found. Downloading a private Temurin runtime...", 0)
+    try:
+        metadata = json.loads(_limited_urlopen(JAVA_METADATA_URL, "api.adoptium.net", MAX_JAVA_METADATA_BYTES))
+        entry = next(
+            item for item in metadata if isinstance(item, dict)
+            and isinstance(item.get("binary"), dict)
+            and isinstance(item["binary"].get("package"), dict)
+        )
+        package = entry["binary"]["package"]
+        url = package.get("link")
+        checksum = package.get("checksum")
+        if not isinstance(url, str) or not isinstance(checksum, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", checksum):
+            raise LauncherError("Adoptium returned incomplete Java 17 package metadata")
+        java_dir = hmc_data_dir(root) / "java"
+        java_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="wibsverse-java-", dir=str(root)) as temporary:
+            archive = Path(temporary) / "java17.zip"
+            _download_verified_file(
+                url, archive, ("github.com", "api.adoptium.net"), MAX_JAVA_DOWNLOAD_BYTES, checksum,
+                lambda message, value: progress(message, value),
             )
+            home = _extract_java_archive(archive, java_dir / "wibsverse-temurin-17")
+        if _java_major(home) != JAVA_VERSION:
+            raise LauncherError("Downloaded Java runtime is not Java 17")
+        ensure_hmc_config(root)
+        progress("Java 17 is ready", 100)
+        return home
+    except (OSError, ValueError, TypeError, KeyError, StopIteration, json.JSONDecodeError, zipfile.BadZipFile,
+            urllib.error.URLError) as error:
+        raise LauncherError(f"Could not install Java 17: {error}") from error
 
 
 def _safe_normalize(filename: str) -> str | None:
@@ -374,103 +628,263 @@ def install_release(root: Path, release: Release, progress: Progress = lambda *_
         lock.unlink(missing_ok=True)
 
 
-def find_prism() -> str | None:
+def find_headlessmc() -> str | None:
     paths = [
-        shutil.which("prismlauncher"),
-        os.path.join(os.environ.get("ProgramFiles", ""), "PrismLauncher", "prismlauncher.exe"),
-        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "PrismLauncher", "prismlauncher.exe"),
-        os.path.join(os.environ.get("ProgramFiles(x86)", ""), "PrismLauncher", "prismlauncher.exe"),
+        shutil.which("headlessmc"),
+        shutil.which("headlessmc.exe"),
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "headlessmc", "bin", "headlessmc.exe"),
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "headlessmc", "headlessmc.exe"),
+        os.path.join(os.environ.get("ProgramFiles", ""), "HeadlessMc", "headlessmc.exe"),
+        str(headlessmc_executable_path()),
+        str(app_dir() / "headlessmc.exe"),
     ]
     return next((str(Path(p)) for p in paths if p and Path(p).is_file()), None)
 
 
-def prism_accounts(root: Path) -> list[dict[str, str]]:
-    """Read display names/types only. Never expose/store Prism authentication tokens."""
-    data = load_json(root / "accounts.json", {})
-    out = []
-    if isinstance(data, dict) and isinstance(data.get("accounts"), list):
-        for account in data["accounts"]:
-            if not isinstance(account, dict):
-                continue
-            profile = account.get("profile", {})
-            if not isinstance(profile, dict):
-                continue
-            name = profile.get("name")
-            if isinstance(name, str) and name.strip():
-                item = {"name": name, "type": str(account.get("type", "unknown"))}
-                uuid_text = profile.get("id", "")
-                if isinstance(uuid_text, str) and re.fullmatch(r"[0-9a-fA-F-]{32,36}", uuid_text):
-                    item["uuid"] = uuid_text.replace("-", "").lower()
-                out.append(item)
-    return out
-
-
-def prism_supports_offline(executable: str) -> bool:
+def install_headlessmc(root: Path, progress: Progress = lambda *_: None) -> Path:
+    """Download the pinned official Windows binary into the launcher data directory."""
+    destination = headlessmc_executable_path(root)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(destination.name + ".download")
+    request = urllib.request.Request(
+        HMC_DOWNLOAD_URL,
+        headers={"User-Agent": "WibsverseLauncher/0.3", "Accept": "application/octet-stream"},
+    )
+    digest = hashlib.sha256()
+    total = 0
     try:
-        result = subprocess.run([executable, "--help"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                timeout=12, text=True, check=False, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        return "--offline" in result.stdout
-    except (OSError, subprocess.TimeoutExpired):
-        return False
+        progress(f"Downloading HeadlessMc {HMC_VERSION}...", 0)
+        with urllib.request.urlopen(request, timeout=60) as response, temporary.open("wb") as target:
+            final = urllib.parse.urlparse(response.geturl())
+            if final.scheme != "https" or not (
+                final.hostname == "github.com" or (final.hostname or "").endswith("githubusercontent.com")
+            ):
+                raise LauncherError("HeadlessMc download redirected to an unexpected host")
+            expected = int(response.headers.get("Content-Length", 0))
+            if expected > MAX_HMC_DOWNLOAD_BYTES:
+                raise LauncherError("HeadlessMc download exceeds the size limit")
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_HMC_DOWNLOAD_BYTES:
+                    raise LauncherError("HeadlessMc download exceeds the size limit")
+                digest.update(chunk)
+                target.write(chunk)
+                progress("Downloading HeadlessMc...", min(90, total * 90 // max(expected, total)))
+        if total == 0:
+            raise LauncherError("HeadlessMc download was empty")
+        if digest.hexdigest().lower() != HMC_SHA256:
+            raise LauncherError("HeadlessMc download SHA-256 does not match the pinned release")
+        os.replace(temporary, destination)
+        progress(f"HeadlessMc {HMC_VERSION} installed", 100)
+        return destination
+    except (OSError, urllib.error.URLError, TimeoutError) as error:
+        raise LauncherError(f"Could not download HeadlessMc: {error}") from error
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
-def validate_offline_name(name: str) -> bool:
-    return bool(re.fullmatch(r"[A-Za-z0-9_]{3,16}", name))
+def _creationflags() -> int:
+    return getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
-def prism_launch_command(executable: str, root: Path, online_name: str | None = None,
-                         offline_name: str | None = None, join_server: bool = True) -> list[str]:
-    if bool(online_name) == bool(offline_name):
-        raise LauncherError("Choose exactly one Microsoft profile or offline username")
-    command = [executable, "-d", str(root), "--launch", INSTANCE_ID]
-    if online_name:
-        # Only use an account Prism already knows about; it owns the credentials.
-        if online_name not in {a["name"] for a in prism_accounts(root)}:
-            raise LauncherError("This account isn't registered in Prism. Use Manage Accounts first")
-        command.extend(["--profile", online_name])
-    else:
-        if not validate_offline_name(offline_name or ""):
-            raise LauncherError("Offline usernames must be 3-16 letters, digits, or underscores")
-        if not prism_supports_offline(executable):
-            raise LauncherError("This Prism build does not advertise --offline support. Update to Prism 11.1.1")
-        command.extend(["--offline", offline_name])
-    if join_server and online_name:
+def hmc_command(executable: str, *arguments: str) -> list[str]:
+    return [executable, *arguments]
+
+
+def hmc_login_command(executable: str) -> list[str]:
+    return hmc_command(executable, "account", "--provider", "default", "login")
+
+
+def hmc_account_list_command(executable: str) -> list[str]:
+    return hmc_command(executable, "account", "list")
+
+
+def hmc_offline_login_command(executable: str) -> list[str]:
+    return hmc_command(executable, "account", "--provider", "offline", "login")
+
+
+def hmc_offline_accounts_path(root: Path) -> Path:
+    return hmc_data_dir(root) / ".auth" / "offline" / ".accounts.json"
+
+
+def create_hmc_offline_account(root: Path, name: str) -> dict[str, str]:
+    """Add a tokenless offline account using HMC's versioned account-store schema."""
+    name = name.strip()
+    if not name or any(char in name for char in "\r\n\x00"):
+        raise LauncherError("Enter a valid offline account name")
+    path = hmc_offline_accounts_path(root)
+    try:
+        data = load_json(path, {})
+    except (OSError, ValueError, TypeError) as error:
+        raise LauncherError(f"Could not read offline accounts: {error}") from error
+    if not isinstance(data, dict):
+        raise LauncherError("HMC offline account store is invalid")
+    accounts = data.get("accounts", {})
+    if accounts is None:
+        accounts = {}
+    if not isinstance(accounts, dict):
+        raise LauncherError("HMC offline account store is invalid")
+    if any(isinstance(existing, str) and existing.casefold() == name.casefold() for existing in accounts):
+        raise LauncherError(f"An account named {name} already exists")
+    account = {
+        "provider": "offline",
+        "name": name,
+        "uuid": str(uuid.uuid4()),
+        "token": "",
+        "type": "msa",
+        "xuid": "",
+    }
+    accounts[name] = account
+    atomic_json(path, {"accounts": accounts, "version": 0})
+    return account
+
+
+def hmc_remove_account_command(executable: str, name: str) -> list[str]:
+    if not name or any(char in name for char in "\r\n\x00"):
+        raise LauncherError("Invalid account name")
+    return hmc_command(executable, "account", "remove", name)
+
+
+def hmc_select_account_command(executable: str, name: str) -> list[str]:
+    if not name or any(char in name for char in "\r\n\x00"):
+        raise LauncherError("Invalid Microsoft account name")
+    return hmc_command(executable, "account", "select", name)
+
+
+def hmc_profile_path(root: Path) -> Path:
+    return root / "config" / "headlessmc" / "profiles" / (HMC_PROFILE_NAME + ".json")
+
+
+def hmc_profile_command(executable: str, root: Path) -> list[str]:
+    return hmc_command(
+        executable, "profile", "add", "forge", MINECRAFT_VERSION, FORGE_VERSION,
+        "--force", "--name", HMC_PROFILE_NAME, "--dir", str(game_dir(root)),
+    )
+
+
+def hmc_launch_command(executable: str, account_name: str, join_server: bool = True) -> list[str]:
+    if not account_name or any(char in account_name for char in "\r\n\x00"):
+        raise LauncherError("Choose a Microsoft account before launching")
+    # HMC itself runs as a hidden subprocess; omit HMC's --headless flag so Minecraft
+    # keeps its normal graphical client for gameplay.
+    command = hmc_command(executable, "launch")
+    if join_server:
         command.extend(["--server", SERVER])
+    command.append(HMC_PROFILE_NAME)
     return command
 
 
-def standard_prism_data_dir() -> Path:
-    """The data root used by the installed (non-portable) Prism on Windows."""
-    roaming = os.environ.get("APPDATA")
-    if roaming:
-        return Path(roaming) / "PrismLauncher"
-    # Non-Windows development fallback; the Windows build is the target.
-    return Path.home() / ".local" / "share" / "PrismLauncher"
+def _profile_version_matches(value: object) -> bool:
+    if isinstance(value, dict):
+        platform = value.get("platform")
+        version = value.get("version")
+        build = value.get("build")
+        if isinstance(build, dict):
+            build = build.get("value") or build.get("orElse")
+        if isinstance(build, list) and len(build) == 1:
+            build = build[0]
+        return platform == "forge" and version == MINECRAFT_VERSION and build == FORGE_VERSION
+    if isinstance(value, str):
+        return value.lower() in {
+            f"forge/{MINECRAFT_VERSION}/{FORGE_VERSION}".lower(),
+            f"forge-{MINECRAFT_VERSION}-{FORGE_VERSION}".lower(),
+        }
+    return False
+
+
+def hmc_profile_is_pinned(root: Path) -> bool:
+    data = load_json(hmc_profile_path(root), {})
+    if not isinstance(data, dict):
+        return False
+    return _profile_version_matches(data.get("currentVersion")) or _profile_version_matches(data.get("version"))
+
+
+def run_hmc(
+    executable: str,
+    root: Path,
+    arguments: list[str],
+    timeout: int = 30,
+    input_text: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    ensure_instance(root)
+    try:
+        result = subprocess.run(
+            hmc_command(executable, *arguments),
+            env=hmc_environment(root),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            input=input_text,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            check=False,
+            creationflags=_creationflags(),
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise LauncherError(f"HeadlessMC command failed: {error}") from error
+    if result.returncode != 0:
+        output = result.stdout.strip()
+        detail = output[-1200:] if output else f"exit code {result.returncode}"
+        raise LauncherError(f"HeadlessMC command failed: {detail}")
+    return result
+
+
+def parse_hmc_accounts(output: str) -> list[dict[str, str]]:
+    """Parse HMC's public account table without touching its token store."""
+    accounts: list[dict[str, str]] = []
+    uuid_re = re.compile(r"^[0-9a-fA-F-]{32,36}$")
+    ansi_re = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+    for line in output.splitlines():
+        line = ansi_re.sub("", line)
+        columns = re.split(r"\s{2,}", line.strip())
+        if len(columns) < 4 or columns[0].lower() == "name":
+            continue
+        name, uuid_text, account_type, provider = columns[:4]
+        if not name or not uuid_re.fullmatch(uuid_text):
+            continue
+        if account_type.lower() not in {"msa", "microsoft"}:
+            continue
+        accounts.append({
+            "mode": "offline" if provider.lower() == "offline" else "microsoft",
+            "name": name,
+            "uuid": uuid_text.replace("-", "").lower(),
+            "provider": provider,
+        })
+    return accounts
+
+
+def hmc_accounts(executable: str, root: Path) -> list[dict[str, str]]:
+    return parse_hmc_accounts(run_hmc(executable, root, hmc_account_list_command(executable)[1:]).stdout)
 
 
 def legacy_prism_data_dir() -> Path:
-    """Wibsverse v0.1 isolated Prism root; retained for safe migration."""
-    return prism_data_dir()
+    """The isolated Prism root used by the previous wrapper release."""
+    return app_dir() / "PrismData"
+
+
+def _prism_instance_dir(root: Path) -> Path:
+    return root / "instances" / INSTANCE_ID
 
 
 def migrate_legacy_instance(old_root: Path, new_root: Path, progress: Progress = lambda *_: None) -> bool:
-    """Copy ONLY the Wibsverse instance to the shared root, never account tokens.
-
-    Keep the old instance untouched as a backup. Refuse to merge with an existing
-    destination instance or follow symlinks in the old instance tree.
-    """
-    source = instance_dir(old_root)
-    target = instance_dir(new_root)
+    """Copy only old Prism game files into the HMC game directory."""
+    source_instance = _prism_instance_dir(old_root)
+    source = source_instance / ".minecraft"
+    target = game_dir(new_root)
     if not source.exists():
         return False
-    if target.exists():
-        raise LauncherError("Wibsverse already exists in the destination Prism folder; refusing to overwrite it")
+    if target.exists() and any(target.iterdir()):
+        raise LauncherError("The HMC game directory already contains files; refusing to overwrite it")
     if source.is_symlink():
-        raise LauncherError("The original instance folder is a symlink; cannot migrate safely")
+        raise LauncherError("The old Prism game directory is a symlink; cannot migrate safely")
     paths = list(source.rglob("*"))
     for path in paths:
         if path.is_symlink():
-            raise LauncherError("Legacy instance contains a symlink; migration must be done manually")
+            raise LauncherError("The old Prism game directory contains a symlink; migration must be done manually")
     files_total = max(1, sum(p.is_file() for p in paths))
     copied = 0
 
@@ -479,7 +893,7 @@ def migrate_legacy_instance(old_root: Path, new_root: Path, progress: Progress =
         outcome = shutil.copy2(src, dest)
         copied += 1
         if copied % 20 == 0 or copied == files_total:
-            progress(f"Copying existing modpack files ({copied}/{files_total})", int(copied / files_total * 99))
+            progress(f"Copying existing Wibsverse files ({copied}/{files_total})", int(copied / files_total * 99))
         return outcome
 
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -490,6 +904,9 @@ def migrate_legacy_instance(old_root: Path, new_root: Path, progress: Progress =
         if target.exists():
             raise LauncherError("Destination appeared during migration; refusing to overwrite it")
         tmp.rename(target)
+        state = source_instance / "wibsverse-installed.json"
+        if state.is_file():
+            shutil.copy2(state, new_root / "wibsverse-installed.json")
         progress("Previous modpack successfully migrated", 100)
     finally:
         if tmp.exists():

@@ -6,12 +6,14 @@ import binascii
 import json
 import re
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
 PROFILE_BASE = "https://sessionserver.mojang.com/session/minecraft/profile/"
 SKIN_HOST = "textures.minecraft.net"
+AVATAR_HOST = "mc-heads.net"
 MAX_PROFILE_BYTES = 100_000
 MAX_SKIN_BYTES = 2_000_000
 CACHE_SECONDS = 24 * 60 * 60
@@ -62,13 +64,23 @@ def skin_png_for_uuid(uuid_text: str, cache: Path) -> bytes | None:
     path = cache / (uuid_text + ".png")
     if path.is_file() and (time.time() - path.stat().st_mtime < CACHE_SECONDS):
         return path.read_bytes()
-    profile_raw = _limited_urlopen(PROFILE_BASE + uuid_text, "sessionserver.mojang.com", MAX_PROFILE_BYTES)
-    skin_url = texture_url_from_profile(json.loads(profile_raw))
-    if not skin_url:
-        return None
-    data = _limited_urlopen(skin_url, SKIN_HOST, MAX_SKIN_BYTES)
+    data = None
+    try:
+        profile_raw = _limited_urlopen(PROFILE_BASE + uuid_text, "sessionserver.mojang.com", MAX_PROFILE_BYTES)
+        skin_url = texture_url_from_profile(json.loads(profile_raw))
+        if skin_url:
+            data = _limited_urlopen(skin_url, SKIN_HOST, MAX_SKIN_BYTES)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError, urllib.error.URLError):
+        # The session profile can outlive its texture URL. Use a rendered public head below.
+        data = None
+    if data is None:
+        data = _limited_urlopen(
+            f"https://{AVATAR_HOST}/avatar/{uuid_text}/40.png?overlay",
+            AVATAR_HOST,
+            MAX_SKIN_BYTES,
+        )
     if not data.startswith(b"\x89PNG\r\n\x1a\n"):
-        raise ValueError("Minecraft skin server returned a non-PNG image")
+        raise ValueError("Minecraft skin service returned a non-PNG image")
     cache.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     try:
