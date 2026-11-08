@@ -2,31 +2,27 @@
 
 <img width="2379" height="1496" alt="image" src="https://github.com/user-attachments/assets/d23d9db4-b235-413e-86e3-88c31fef4003" />
 
-A Python/PySide6 launcher for **Wib's Demon Slayer**, Minecraft **1.20.1**, Forge **47.4.23**, supporting Windows and macOS on Intel and Apple Silicon. It uses **HeadlessMc** as a hidden backend for Microsoft authentication and Minecraft launching, while updating the Wibsverse modpack from the official download page.
+A Python/PySide6 launcher for **Wib's Demon Slayer**, Minecraft **1.20.1**, Forge **47.4.23**, supporting Windows and (maybe) macOS. It uses **HeadlessMc** as a hidden backend for Microsoft authentication and Minecraft launching, while updating the Wibsverse modpack from the official download page.
 
-**Status:** Source-code prototype. Automated tests cover the updater, skin fallback, HeadlessMc commands, and runtime setup. A real Microsoft login and Forge launch still need to be verified on Windows.
-
-## Requirements
-
-- Windows or macOS
-- A Microsoft account that owns Minecraft Java Edition if using online authentication
-- Internet access for the first HMC, Java, Forge, and modpack setup
+**Status:** Source-code prototype. Automated tests cover the updater, skin fallback, HeadlessMc commands, and runtime setup.
 
 If HeadlessMc is not found, the launcher automatically downloads the pinned official release (`3.0.0-RC8`) for the current operating system and CPU architecture from GitHub, then verifies its SHA-256 checksum. It installs the binary under `HeadlessMc/bin` in the launcher data directory. If Java 17 is not available, it downloads and verifies a private Temurin 17 runtime under HMC's isolated data directory. You can also select an existing HMC executable through Settings → Set HeadlessMc Path.
 
-## Getting Started
+## Getting Started 
 
-```powershell
-py -m pip install -r requirements.txt
-py launcher.py
-```
+The launcher can be installed from the released tab.
 
 1. Open the account menu or the **ADD ACCOUNT** button.
 2. Choose a Microsoft account and complete the HeadlessMc device-code login, or choose an offline account and enter a player name. Offline accounts do not require Microsoft sign-in.
 3. Install or wait for the Wibsverse modpack update.
 4. Click **PLAY WIBSVERSE**. Java 17 and the pinned Forge profile are prepared automatically.
 
-The launcher never opens Prism. HeadlessMc owns and refreshes Microsoft credentials; the wrapper only reads the public account table containing player name, UUID, account type, and provider. Offline account records are tokenless and are stored in HMC's isolated offline account store.
+## Getting Started (developer environment)
+
+```powershell
+py -m pip install -r requirements.txt
+py launcher.py
+```
 
 ## HeadlessMc Integration
 
