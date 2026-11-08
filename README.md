@@ -1,16 +1,18 @@
 # Wibsverse Launcher
 
-A Python/PySide6 Windows-first launcher for **Wib's Demon Slayer**, Minecraft **1.20.1**, Forge **47.4.23**. It uses **HeadlessMc** as a hidden backend for Microsoft authentication and Minecraft launching, while updating the Wibsverse modpack from the official download page.
+<img width="2379" height="1496" alt="image" src="https://github.com/user-attachments/assets/d23d9db4-b235-413e-86e3-88c31fef4003" />
+
+A Python/PySide6 launcher for **Wib's Demon Slayer**, Minecraft **1.20.1**, Forge **47.4.23**, supporting Windows and macOS on Intel and Apple Silicon. It uses **HeadlessMc** as a hidden backend for Microsoft authentication and Minecraft launching, while updating the Wibsverse modpack from the official download page.
 
 **Status:** Source-code prototype. Automated tests cover the updater, skin fallback, HeadlessMc commands, and runtime setup. A real Microsoft login and Forge launch still need to be verified on Windows.
 
 ## Requirements
 
-- Windows 10 or newer
+- Windows or macOS
 - A Microsoft account that owns Minecraft Java Edition if using online authentication
 - Internet access for the first HMC, Java, Forge, and modpack setup
 
-If `headlessmc.exe` is not found, the launcher automatically downloads the pinned official Windows x64 release (`3.0.0-RC8`) from GitHub and verifies its SHA-256 checksum. It installs the binary under `HeadlessMc\bin` in the launcher data directory. If Java 17 is not available, it downloads and verifies a private Temurin 17 runtime under HMC's isolated data directory. You can also select an existing HMC executable through Settings → Set HeadlessMc Path.
+If HeadlessMc is not found, the launcher automatically downloads the pinned official release (`3.0.0-RC8`) for the current operating system and CPU architecture from GitHub, then verifies its SHA-256 checksum. It installs the binary under `HeadlessMc/bin` in the launcher data directory. If Java 17 is not available, it downloads and verifies a private Temurin 17 runtime under HMC's isolated data directory. You can also select an existing HMC executable through Settings → Set HeadlessMc Path.
 
 ## Getting Started
 
@@ -36,15 +38,18 @@ The launcher never opens Prism. HeadlessMc owns and refreshes Microsoft credenti
 - HMC-Specifics is disabled because it does not currently support Forge 1.20.1.
 - The server join option adds `--server play.wibsverse.com`.
 
-The wrapper isolates HeadlessMc's XDG data/config/state/cache directories below:
+The wrapper isolates HeadlessMc's data/config/state/cache directories below the platform-specific launcher data directory:
 
 ```text
-%LOCALAPPDATA%\WibsverseLauncher\
+Windows: `%LOCALAPPDATA%\WibsverseLauncher\`
+macOS: `~/Library/Application Support/WibsverseLauncher/`
+
+```text
   settings.json
   avatars\
   headlessmc-launch.log
   HeadlessMc\
-    bin\headlessmc.exe     # automatically installed HMC backend
+    bin\headlessmc         # automatically installed HMC backend; .exe on Windows
     data\headlessmc\       # Java runtime and Microsoft credentials
     config\headlessmc\     # wrapper-owned HMC configuration
       profiles\            # pinned Wibsverse Forge profile
@@ -56,13 +61,36 @@ The wrapper never copies or displays HMC account tokens.
 
 ## Build
 
-On Windows:
+Build on the operating system you are packaging for. PyInstaller does not reliably cross-compile Windows and macOS applications.
+
+### Windows
+
+Requirements: Windows 10 or newer, Python 3.11 or newer, and internet access.
 
 ```powershell
 build_windows.bat
 ```
 
-Output: `dist\WibsverseLauncher.exe`. The build includes `assets\wibsversehero.png`; HMC and Java are installed by the launcher when needed.
+The script creates `.build-venv`, installs the build dependencies, and produces `dist\WibsverseLauncher.exe`. HMC and Java are installed by the launcher when needed.
+
+### macOS
+
+Requirements: macOS, Python 3.11 or newer, and internet access. Run the build on the target architecture: an Intel Mac produces an x64 `.app`; an Apple Silicon Mac produces an arm64 `.app`.
+
+```zsh
+chmod +x build_macos.sh
+./build_macos.sh
+```
+
+The script creates `.build-venv`, installs the build dependencies, and produces `dist/WibsverseLauncher.app`. Create a release-ready archive with:
+
+```zsh
+ditto -c -k --sequesterRsrc --keepParent \
+  "dist/WibsverseLauncher.app" \
+  "dist/WibsverseLauncher-mac-$(uname -m).zip"
+```
+
+Upload the resulting `.zip` to the GitHub release. The filename should include `mac`, such as `WibsverseLauncher-mac-x86_64.zip` or `WibsverseLauncher-mac-arm64.zip`.
 
 ## Launcher Versioning and Updates
 

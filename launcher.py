@@ -702,7 +702,7 @@ class Launcher(QWidget):
         titlebar.setFixedHeight(32)
         title_layout = QHBoxLayout(titlebar)
         title_layout.setContentsMargins(18, 0, 10, 0)
-        window_name = QLabel("WIBSVERSE LAUNCHER")
+        window_name = QLabel(f"WIBSVERSE LAUNCHER  v{LAUNCHER_VERSION}")
         window_name.setObjectName("windowName")
         title_layout.addWidget(window_name)
         title_layout.addStretch()
@@ -1295,6 +1295,7 @@ class Launcher(QWidget):
         except OSError as error:
             self._launcher_download_failed(f"Could not open the launcher update: {error}")
             return
+        self.launcher_download_task = None
         self.status.setText("Launcher update opened. Closing this launcher...")
         application = QApplication.instance()
         if application is not None:
@@ -1426,7 +1427,7 @@ class Launcher(QWidget):
         if (self.task is not None or self.migration_task is not None
                 or self.login_task is not None or self.offline_task is not None
                 or self.remove_account_task is not None or self.launch_task is not None
-                or self.launcher_download_task is not None):
+                or self.launcher_release_task is not None or self.launcher_download_task is not None):
             event.ignore()
             QMessageBox.information(self, "Updating", "Please keep the launcher open until the current operation finishes.")
             return

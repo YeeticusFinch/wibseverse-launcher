@@ -3,6 +3,7 @@ import io
 import json
 import os
 import sys
+import tarfile
 import tempfile
 import unittest
 import zipfile
@@ -16,6 +17,34 @@ URL = "https://cdn.wibsverse.com/modpacks/ds/manual/20261029-2.3.0/WibsDemonSlay
 
 
 class LauncherCoreTests(unittest.TestCase):
+    def test_macos_platform_release_and_java_metadata(self):
+        with patch.object(core.sys, "platform", "darwin"), patch("platform.machine", return_value="arm64"):
+            asset, checksum, url = core.hmc_release()
+            self.assertEqual(asset, "headlessmc-launcher-macos-arm64")
+            self.assertRegex(checksum, r"^[0-9a-f]{64}$")
+            self.assertIn("headlessmc-launcher-macos-arm64", url)
+            self.assertIn("architecture=aarch64", core.java_metadata_url())
+            self.assertIn("os=mac", core.java_metadata_url())
+            self.assertEqual(core.headlessmc_executable_path(Path("/tmp/hmc")).name, "headlessmc")
+
+    def test_extract_java_tarball(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            archive = base / "java.tar.gz"
+            with tarfile.open(archive, "w:gz") as tar:
+                content = b"#!/bin/sh\necho 'openjdk version \"17.0.1\"'\n"
+                info = tarfile.TarInfo("jdk/Contents/Home/bin/java")
+                info.size = len(content)
+                info.mode = 0o755
+                tar.addfile(info, io.BytesIO(content))
+            destination = base / "managed-java"
+            result = core._extract_java_archive(archive, destination)
+            self.assertEqual(result, destination)
+            java = destination / "bin" / "java"
+            self.assertTrue(java.is_file())
+            if os.name != "nt":
+                self.assertTrue(java.stat().st_mode & 0o100)
+
     def test_latest_launcher_release_uses_newest_non_draft_tag(self):
         payload = json.dumps([
             {"tag_name": "0.3", "draft": False, "html_url": "https://github.com/YeeticusFinch/wibseverse-launcher/releases/tag/0.3", "assets": [
