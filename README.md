@@ -92,6 +92,23 @@ ditto -c -k --sequesterRsrc --keepParent \
 
 Upload the resulting `.zip` to the GitHub release. The filename should include `mac`, such as `WibsverseLauncher-mac-x86_64.zip` or `WibsverseLauncher-mac-arm64.zip`.
 
+### Automated Windows and macOS builds
+
+The `.github/workflows/build-release.yml` workflow builds all three native packages:
+
+- Windows x64 executable
+- macOS Intel `.app` archive
+- macOS Apple Silicon `.app` archive
+
+Run it manually from the repository's **Actions** tab, or push a numeric version tag to build and publish a GitHub release automatically:
+
+```powershell
+git tag 0.4
+git push origin 0.4
+```
+
+The tag must match the `LAUNCHER_VERSION` value in `core.py`.
+
 ## Launcher Versioning and Updates
 
 The current launcher version is defined in one place:
@@ -105,8 +122,8 @@ When releasing a new launcher version:
 
 1. Change `LAUNCHER_VERSION` in `core.py`.
 2. Build the launcher for the supported platform(s).
-3. Create a GitHub release in [`YeeticusFinch/wibseverse-launcher`](https://github.com/YeeticusFinch/wibseverse-launcher/releases/) using the same numeric tag, such as `0.4`.
-4. Upload the platform installer or package as a release asset. Windows assets should be `.exe` or `.msi`; macOS assets should be `.dmg`, `.pkg`, or `.zip` and include `mac`, `darwin`, or `osx` in the filename.
+3. Commit the change and push a matching numeric tag, such as `0.4`; the GitHub Actions workflow builds and publishes the release assets automatically.
+4. If uploading assets manually, Windows assets should be `.exe` or `.msi`; macOS assets should be `.dmg`, `.pkg`, or `.zip` and include `mac`, `darwin`, or `osx` in the filename.
 5. Publish the release. Draft releases are ignored; prereleases are checked as well.
 
 At startup, the launcher checks the GitHub releases API. If a newer release is found, it prompts the user with **Update Launcher**. The button downloads and opens the compatible release asset, then closes the current launcher. If no compatible asset is attached, it opens the release page instead.
