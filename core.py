@@ -23,7 +23,7 @@ from pathlib import Path, PurePosixPath
 from typing import Callable
 
 DOWNLOAD_PAGE = "https://wibsverse.com/download"
-LAUNCHER_VERSION = "0.3"
+LAUNCHER_VERSION = "0.4"
 LAUNCHER_RELEASES_API = "https://api.github.com/repos/YeeticusFinch/wibseverse-launcher/releases"
 SERVER = "play.wibsverse.com"
 MINECRAFT_VERSION = "1.20.1"
@@ -58,7 +58,7 @@ ALLOWED_DIRS = {
     "shaderpacks", "patchouli_books", "texturepacks", "journeymap", "xaero",
     "openloader", "customnpcs", "schematics", "global_packs", "fancymenu",
 }
-ZIP_VERSION_RE = re.compile(r"Wibs?DemonSlayer[-_](\d+(?:\.\d+){1,3})\.zip$", re.I)
+ZIP_VERSION_RE = re.compile(r"^Wibs?DemonSlayer[-_](\d+(?:\.\d+){1,3})(?:[-_](?:manual|manuel))?\.zip$", re.I)
 Progress = Callable[[str, int], None]
 
 
