@@ -322,8 +322,8 @@ def hmc_config_file(root: Path) -> Path:
     return root / "config" / "headlessmc" / "config.properties"
 
 
-def hmc_environment(root: Path) -> dict[str, str]:
-    """Give HMC isolated XDG directories, including on Windows."""
+def hmc_environment(root: Path, java_properties: dict[str, str] | None = None) -> dict[str, str]:
+    """Give HMC isolated XDG directories and optional child-JVM system properties."""
     env = os.environ.copy()
     env.update({
         "XDG_DATA_HOME": str(root / "data"),
@@ -331,6 +331,19 @@ def hmc_environment(root: Path) -> dict[str, str]:
         "XDG_STATE_HOME": str(root / "state"),
         "XDG_CACHE_HOME": str(root / "cache"),
     })
+    if java_properties:
+        options = []
+        for name, value in java_properties.items():
+            if (
+                not re.fullmatch(r"[A-Za-z0-9_.-]+", name)
+                or not isinstance(value, str)
+                or any(char in value for char in ('\r', '\n', '\x00', '"'))
+            ):
+                raise LauncherError("Invalid Java system property for Minecraft launch")
+            quoted_value = f'"{value}"' if any(char.isspace() for char in value) else value
+            options.append(f"-D{name}={quoted_value}")
+        existing = env.get("JAVA_TOOL_OPTIONS", "").strip()
+        env["JAVA_TOOL_OPTIONS"] = " ".join(part for part in (existing, *options) if part)
     return env
 
 
@@ -941,11 +954,25 @@ def hmc_offline_accounts_path(root: Path) -> Path:
     return hmc_data_dir(root) / ".auth" / "offline" / ".accounts.json"
 
 
-def create_hmc_offline_account(root: Path, name: str) -> dict[str, str]:
+def account_credential_key(account: dict[str, str]) -> str:
+    """Return a stable, non-secret OS-keychain key for a Minecraft account."""
+    mode = account.get("mode")
+    uuid_text = str(account.get("uuid") or "").replace("-", "").lower()
+    if mode not in {"offline", "microsoft"} or not re.fullmatch(r"[0-9a-f]{32}", uuid_text):
+        raise LauncherError("Cannot identify this Minecraft account for credential storage")
+    return f"{mode}:{uuid_text}"
+
+
+def create_hmc_offline_account(root: Path, name: str, uuid_text: str | None = None) -> dict[str, str]:
     """Add a tokenless offline account using HMC's versioned account-store schema."""
     name = name.strip()
     if not name or any(char in name for char in "\r\n\x00"):
         raise LauncherError("Enter a valid offline account name")
+    uuid_text = uuid_text or str(uuid.uuid4())
+    try:
+        uuid_text = str(uuid.UUID(uuid_text))
+    except (ValueError, AttributeError) as error:
+        raise LauncherError("Invalid offline account UUID") from error
     path = hmc_offline_accounts_path(root)
     try:
         data = load_json(path, {})
@@ -963,7 +990,7 @@ def create_hmc_offline_account(root: Path, name: str) -> dict[str, str]:
     account = {
         "provider": "offline",
         "name": name,
-        "uuid": str(uuid.uuid4()),
+        "uuid": uuid_text,
         "token": "",
         "type": "msa",
         "xuid": "",
@@ -971,6 +998,24 @@ def create_hmc_offline_account(root: Path, name: str) -> dict[str, str]:
     accounts[name] = account
     atomic_json(path, {"accounts": accounts, "version": 0})
     return account
+
+
+def remove_hmc_offline_account(root: Path, name: str) -> bool:
+    """Remove one offline record by case-insensitive username."""
+    path = hmc_offline_accounts_path(root)
+    try:
+        data = load_json(path, {})
+    except (OSError, ValueError, TypeError) as error:
+        raise LauncherError(f"Could not read offline accounts: {error}") from error
+    if not isinstance(data, dict) or not isinstance(data.get("accounts", {}), dict):
+        raise LauncherError("HMC offline account store is invalid")
+    accounts = dict(data.get("accounts") or {})
+    existing = next((key for key in accounts if isinstance(key, str) and key.casefold() == name.casefold()), None)
+    if existing is None:
+        return False
+    accounts.pop(existing)
+    atomic_json(path, {"accounts": accounts, "version": 0})
+    return True
 
 
 def hmc_remove_account_command(executable: str, name: str) -> list[str]:

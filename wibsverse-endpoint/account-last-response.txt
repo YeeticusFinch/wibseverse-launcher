@@ -1,0 +1,52 @@
+alt-svc
+h3=":443"; ma=86400
+cache-control
+max-age=0, no-store, private
+cf-cache-status
+DYNAMIC
+cf-ray
+a58dfbb57db3ebb9-YYZ
+content-encoding
+zstd
+content-security-policy
+frame-ancestors 'self'; object-src 'none'; base-uri 'self'
+content-type
+text/html; charset=utf-8
+date
+Wed, 11 Nov 2026 14:28:24 GMT
+nel
+{"report_to":"cf-nel","success_fraction":0.0,"max_age":604800}
+permissions-policy
+camera=(), geolocation=(), microphone=(), payment=(), usb=()
+pragma
+no-cache
+priority
+u=0,i
+referrer-policy
+strict-origin-when-cross-origin
+referrer-policy
+strict-origin-when-cross-origin
+report-to
+{"group":"cf-nel","max_age":604800,"endpoints":[{"url":"https://a.nel.cloudflare.com/report/v4?s=H1kX5ZnvTSHv8iGltTdwOpDQQBovIAm27N7%2FfLGQhwZ7xyO1ytlOBs7t4QpbKFwVEalapDMWyv9f54mepl2E1aVHU9rr2Rj0RIBZrAlbMNWe6J8VwAYJcjOOXpkNgyL8ob63bg%3D%3D"}]}
+server
+cloudflare
+server-timing
+cfCacheStatus;desc="DYNAMIC"
+server-timing
+cfEdge;dur=13,cfOrigin;dur=160
+server-timing
+cfExtPri
+set-cookie
+XSRF-TOKEN=eyJpdiI6InBaWEh5YlBVRyt4SjZFaVFqUlZrZmc9PSIsInZhbHVlIjoiaWtOd2N1aG5lSDdtcUcxVk1RVUhKQ21ndHJENXJpNHlGWjhHelhpaVQ4dXNMSWh0SXFGVTk4MGE0Zk9qVlN2dHdLS0Y4YlphOGJYK2lvc0Q3RzZNRVZSaC85VUFNZ2FqUmxtZlJkYzBxa3cvWkFyZk82alFSSEVsL2JDaTFpZVIiLCJtYWMiOiJkNDkwMDY2MThlZDJlOTBkMWZhOTE0N2U0NDNhZDhmM2QxMTVlYzQwYzM5ZmMzZmUwOTViMDUzZmQ2NmQ1NGJjIiwidGFnIjoiIn0%3D; expires=Wed, 11 Nov 2026 16:28:24 GMT; Max-Age=7200; path=/; secure; samesite=lax
+set-cookie
+wibs-verse-session=eyJpdiI6IlcvdWNuUVFVMnlmZ2E3RGtrOUtGZmc9PSIsInZhbHVlIjoiYUxVRzk1dTNHcTlaZzVydnFFcUwzQXM1OWtwNXpXL0xsTUFlbjZ2bU56ZjVzS2NPRGdGT3Z4bzNiRWhTRXBjRkhEY3l5dHdCNERueGM5dDJRc0hKVzduRDlkOWUweEZ3cHNSSzZKQTUrMFgrVTdpakQzNWpTaEovT3ZVb2NpNlkiLCJtYWMiOiIwNjA0ZThhMjNmOTMwZTdlNzczMzEzYWQyZGM4MTc1NGQ5Y2ViMzZiZTI1MmIwYWJiMDU0ODgzYzhiNjIzZDRlIiwidGFnIjoiIn0%3D; expires=Wed, 11 Nov 2026 16:28:24 GMT; Max-Age=7200; path=/; secure; httponly; samesite=lax
+strict-transport-security
+max-age=31536000; includeSubDomains
+vary
+accept-encoding
+x-content-type-options
+nosniff
+x-content-type-options
+nosniff
+x-frame-options
+SAMEORIGIN

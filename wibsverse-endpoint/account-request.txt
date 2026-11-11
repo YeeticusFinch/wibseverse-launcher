@@ -1,0 +1,40 @@
+:authority
+www.wibsverse.com
+:method
+GET
+:path
+/account
+:scheme
+https
+accept
+text/html,application/xhtml+xml,application/xml;q=0.9,image/jxl,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7
+accept-encoding
+gzip, deflate, br, zstd
+accept-language
+en-US,en;q=0.9,fr;q=0.8
+cache-control
+max-age=0
+cookie
+XSRF-TOKEN=eyJpdiI6IjRNMEw0OHNUWXBRMDdFdzhkd1JHT2c9PSIsInZhbHVlIjoicS9hU1J5U00yVHIvTm1IbEFEOVBrbVpDWTU0LzJCSXc3cGs5aW03SFhrWmVrKzBCbVpZaUF2eHJGZThuZWR6eCtzS1h5RVVGa0FSQnFvT2pjeFlodk5ld2FRdWcrbUZ5N2N4d2RqbVY5WmRhL0lBYkFNQ3RrNW0vc2hEbHhPdG0iLCJtYWMiOiI2MzA2YzI5ZDRlOGM0NDNlMGVlODE1Yzg1YTI3MGUyZDA0NTFhMjYxODE2ODg2MzgyMTc0OTQyNDIwMjdkMjMyIiwidGFnIjoiIn0%3D; wibs-verse-session=eyJpdiI6IldscjNBeUt6NURkc0lTZlJWcmNQRkE9PSIsInZhbHVlIjoiYStZMzBSeld4UnJhdFVwaWVod2F6enB0S1J5QWEvQm1mRHI1bWx0eW9xK1c3eFFLNVlsckdaVlIzL2U5RHFDcnNsSDRjVmxVMVNKYmRrOWRjNzdqT0xZcDlWdGZsUDJNM0dVTVRxNlZITlk1TXlSeUNFS2o0RmlMc3AwSVdjUW4iLCJtYWMiOiI1YWU2YThlMmM2Yzc4NDVkZWIyMDkzOGVmYjE1NzhjNGQyMjJmNTFjNDYwODU0NGU1MDkxZDEwMmY0YWZmOGUxIiwidGFnIjoiIn0%3D
+priority
+u=0, i
+referer
+https://www.wibsverse.com/email/verify
+sec-ch-ua
+"Not-A.Brand";v="99", "Google Chrome";v="157", "Chromium";v="157"
+sec-ch-ua-mobile
+?0
+sec-ch-ua-platform
+"Windows"
+sec-fetch-dest
+document
+sec-fetch-mode
+navigate
+sec-fetch-site
+same-origin
+sec-fetch-user
+?1
+upgrade-insecure-requests
+1
+user-agent
+Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36

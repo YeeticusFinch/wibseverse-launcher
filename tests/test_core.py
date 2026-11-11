@@ -196,6 +196,18 @@ class LauncherCoreTests(unittest.TestCase):
             with self.assertRaises(core.LauncherError):
                 core.create_hmc_offline_account(root, "localplayer")
 
+    def test_account_credential_key_uses_stable_uuid_and_offline_rollback(self):
+        account = {"mode": "offline", "uuid": "01234567-89ab-4cde-8fab-0123456789ab"}
+        self.assertEqual(core.account_credential_key(account), "offline:0123456789ab4cde8fab0123456789ab")
+        with self.assertRaises(core.LauncherError):
+            core.account_credential_key({"mode": "offline", "uuid": "invalid"})
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            created = core.create_hmc_offline_account(root, "RollbackPlayer")
+            self.assertTrue(core.remove_hmc_offline_account(root, created["name"]))
+            self.assertFalse(core.remove_hmc_offline_account(root, created["name"]))
+            self.assertEqual(json.loads(core.hmc_offline_accounts_path(root).read_text())["accounts"], {})
+
     def test_install_headlessmc_verifies_and_replaces_binary_atomically(self):
         self.assertRegex(core.HMC_SHA256, r"^[0-9a-f]{64}$")
         payload = b"fake-headlessmc-binary"

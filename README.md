@@ -13,22 +13,30 @@ If HeadlessMc is not found, the launcher automatically downloads the pinned offi
 The launcher can be installed from the released tab.
 
 1. Open the account menu or the **ADD ACCOUNT** button.
-2. Choose a Microsoft account and complete the HeadlessMc device-code login, or choose an offline account and enter a player name. Offline accounts do not require Microsoft sign-in.
+2. Choose a Microsoft account and complete the HeadlessMc device-code login, or add an offline account with its WibsVerse email and password. Offline account passwords are stored in the operating system's credential vault.
 3. Install or wait for the Wibsverse modpack update.
 4. Click **PLAY WIBSVERSE**. Java 17 and the pinned Forge profile are prepared automatically.
+
+For an offline account, the launcher performs the WibsVerse SSO credential handoff, auto-joins when **Auto join server** is enabled, and submits a fresh link code the first time that Minecraft profile connects. Microsoft account launch behavior remains unchanged.
 
 ## Getting Started (developer environment)
 
 ```powershell
+gradle -p launcher-link-bridge build
 py -m pip install -r requirements.txt
 py launcher.py
 ```
+
+Building or running from source requires a Java 17 JDK and Gradle 8.8 to build the Forge link-bridge mod.
 
 ## HeadlessMc Integration
 
 - Login uses `headlessmc account --provider default login`.
 - Account selection uses `headlessmc account select NAME`.
-- Offline accounts are created as tokenless HMC-compatible records and can be removed from the account menu.
+- Offline accounts are created as tokenless HMC-compatible records, require WibsVerse sign-in, and can be removed from the account menu.
+- WibsVerse passwords are stored with the platform credential vault; account email and link state are stored per Minecraft profile in launcher settings.
+- WibsVerse SSO receives its challenge-based short-lived admission credential over a permission-restricted IPC handoff.
+- The bundled Forge client bridge waits for the cracked-account verification prompt before sending `/linkaccount CODE` once.
 - The launcher explicitly installs/verifies `forge 1.20.1 47.4.23`.
 - Launch uses `headlessmc launch wibsverse` from a hidden subprocess, so Minecraft keeps its normal graphical client.
 - HMC-Specifics is disabled because it does not currently support Forge 1.20.1.
@@ -61,7 +69,7 @@ Build on the operating system you are packaging for. PyInstaller does not reliab
 
 ### Windows
 
-Requirements: Windows 10 or newer, Python 3.11 or newer, and internet access.
+Requirements: Windows 10 or newer, Python 3.11 or newer, Java 17 JDK, Gradle 8.8, and internet access.
 
 ```powershell
 build_windows.bat
@@ -71,7 +79,7 @@ The script creates `.build-venv`, installs the build dependencies, and produces 
 
 ### macOS
 
-Requirements: macOS, Python 3.11 or newer, and internet access. Run the build on the target architecture: an Intel Mac produces an x64 `.app`; an Apple Silicon Mac produces an arm64 `.app`.
+Requirements: macOS, Python 3.11 or newer, Java 17 JDK, Gradle 8.8, and internet access. Run the build on the target architecture: an Intel Mac produces an x64 `.app`; an Apple Silicon Mac produces an arm64 `.app`.
 
 ```zsh
 chmod +x build_macos.sh

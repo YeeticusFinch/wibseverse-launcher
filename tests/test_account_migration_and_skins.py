@@ -19,6 +19,16 @@ class IntegrationHelpersTests(unittest.TestCase):
             self.assertEqual(str(core.headlessmc_root()),
                              str(Path(r"C:\Users\Player\AppData\Local") / "WibsverseLauncher" / "HeadlessMc"))
 
+    def test_hmc_environment_passes_safe_properties_to_child_jvm(self):
+        with patch.dict(os.environ, {"JAVA_TOOL_OPTIONS": "-Xmx4G"}, clear=False):
+            env = core.hmc_environment(Path("/tmp/wibsverse"), {"wibs.autojoin": "false"})
+        self.assertIn("-Xmx4G", env["JAVA_TOOL_OPTIONS"])
+        self.assertIn("-Dwibs.autojoin=false", env["JAVA_TOOL_OPTIONS"])
+        env = core.hmc_environment(Path("/tmp/wibsverse"), {"wibs.sso.ipc": "C:/Users/Test User/sso-ipc"})
+        self.assertIn('-Dwibs.sso.ipc="C:/Users/Test User/sso-ipc"', env["JAVA_TOOL_OPTIONS"])
+        quoted = core.hmc_environment(Path("/tmp/wibsverse"), {"wibs.autojoin": "false -Xmx2G"})
+        self.assertIn('-Dwibs.autojoin="false -Xmx2G"', quoted["JAVA_TOOL_OPTIONS"])
+
     def test_hmc_account_parser_keeps_only_public_microsoft_metadata(self):
         output = "name  uuid                                  type  provider\nPlayerA  853c80ef-3c37-49fd-aa49-938b674adae6  msa   default\n"
         result = core.parse_hmc_accounts(output)

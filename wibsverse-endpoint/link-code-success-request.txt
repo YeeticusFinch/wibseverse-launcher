@@ -1,0 +1,25 @@
+:authority
+www.wibsverse.com
+:method
+POST
+:path
+/account/minecraft/link-code
+:scheme
+https
+accept
+text/html,application/xhtml+xml,application/xml;q=0.9,image/jxl,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7
+accept-encoding
+gzip, deflate, br, zstd
+accept-language
+en-US,en;q=0.9,fr;q=0.8
+cache-control
+max-age=0
+content-length
+47
+content-type
+application/x-ww
+
+PAYLOAD
+Form data:
+_token
+DqRmfQxv44ZxQ4Obos5LxF7SHSlzJjK8rNlnkdEZ

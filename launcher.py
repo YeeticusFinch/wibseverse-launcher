@@ -2,22 +2,25 @@
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import os
 import re
+import shutil
 import struct
 import subprocess
 import sys
 import time
+import uuid
 from ctypes import wintypes
 from pathlib import Path
 
 from PySide6.QtCore import QTimer, Qt, QThread, QUrl, QRect, Signal
-from PySide6.QtGui import QDesktopServices, QIcon, QImage, QPainter, QPixmap, QColor, QLinearGradient
+from PySide6.QtGui import QDesktopServices, QIcon, QImage, QPainter, QPixmap, QColor, QLinearGradient, QTextCursor
 from PySide6.QtWidgets import (
     QApplication, QDialog, QFileDialog, QFrame, QHBoxLayout,
-    QLabel, QLineEdit, QMenu, QMessageBox, QProgressBar, QPushButton,
-    QToolButton, QVBoxLayout, QWidget, QCheckBox,
-    QInputDialog,
+    QLabel, QLineEdit, QMenu, QMessageBox, QProgressBar, QPushButton, QFormLayout,
+    QToolButton, QVBoxLayout, QWidget, QCheckBox, QPlainTextEdit, QStackedWidget,
+    QInputDialog, QDialogButtonBox,
 )
 
 from core import (
@@ -26,17 +29,24 @@ from core import (
     hmc_environment, hmc_launch_command, hmc_login_command,
     hmc_profile_command, hmc_remove_account_command,
     hmc_profile_is_pinned, hmc_select_account_command, legacy_prism_data_dir,
-    create_hmc_offline_account, ensure_java17, install_headlessmc, load_json,
+    account_credential_key, create_hmc_offline_account, remove_hmc_offline_account,
+    ensure_java17, install_headlessmc, load_json,
     migrate_legacy_instance, read_installed, run_hmc, fetch_latest_launcher_release,
     download_launcher_asset,
 )
 from skinutils import skin_png_for_uuid
+from wibsverse_auth import (
+    GameAuthCredential, WibsVerseAuthError, WibsVerseGameAuthClient,
+    WibsVerseWebSession, delete_password, load_password, save_password,
+)
+from sso_handoff import SsoHandoff, SsoHandoffError
 
 PINK = "#D9439F"
 INK = "#100B12"
 CREAM = "#FFF1DF"
 MUTED = "#BAA6B4"
 ASSET_DIR = Path(__file__).resolve().parent / "assets"
+LINK_BRIDGE_JAR = "wibsverse-launcher-link-bridge-1.0.0.jar"
 
 
 def launcher_icon_asset() -> Path:
@@ -45,6 +55,30 @@ def launcher_icon_asset() -> Path:
 
 def game_icon_asset() -> Path:
     return ASSET_DIR / "logo.png"
+
+
+def install_launcher_link_bridge(root: Path) -> Path:
+    bundle_root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    candidates = (
+        bundle_root / "mods" / LINK_BRIDGE_JAR,
+        Path(__file__).resolve().parent / "launcher-link-bridge" / "build" / "libs" / LINK_BRIDGE_JAR,
+    )
+    source = next((path for path in candidates if path.is_file()), None)
+    if source is None:
+        raise LauncherError(
+            "The WibsVerse link bridge is missing. Build the launcher-link-bridge Forge mod before launching offline accounts."
+        )
+    destination = game_dir(root) / "mods" / LINK_BRIDGE_JAR
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.is_file() and hashlib.sha256(destination.read_bytes()).digest() == hashlib.sha256(source.read_bytes()).digest():
+        return destination
+    staged = destination.with_name(destination.name + ".installtmp")
+    try:
+        shutil.copy2(source, staged)
+        os.replace(staged, destination)
+    finally:
+        staged.unlink(missing_ok=True)
+    return destination
 
 
 def native_icon_file(source: Path, filename: str) -> Path | None:
@@ -147,6 +181,46 @@ def apply_game_window_icon(process_id: int, icon_file: Path) -> bool:
             user32.SetClassLongPtrW(hwnd, -14, icon)
             user32.SetClassLongPtrW(hwnd, -34, icon)
     return True
+
+
+def wait_for_minecraft_process_id(
+    game_process_id: int, game_folder: Path, launched_at: float | None = None, timeout: float = 90.0
+) -> int:
+    """Find the Minecraft Java child so SSO's IPC is bound to the real game PID."""
+    try:
+        import psutil
+    except ImportError as error:
+        raise LauncherError("The launcher is missing process inspection support required by WibsVerse SSO.") from error
+    target = str(game_folder.resolve()).replace("\\", "/").casefold()
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        matches = []
+        try:
+            root = psutil.Process(game_process_id)
+            processes = [root, *root.children(recursive=True)]
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            processes = psutil.process_iter(["pid", "name", "cmdline", "create_time"])
+        for process in processes:
+            try:
+                info = process.info if hasattr(process, "info") else {
+                    "pid": process.pid, "name": process.name(), "cmdline": process.cmdline(),
+                    "create_time": process.create_time(),
+                }
+                name = (info.get("name") or "").casefold()
+                if name not in {"java.exe", "javaw.exe", "java", "javaw"}:
+                    continue
+                if launched_at is not None and float(info.get("create_time") or 0) < launched_at - 2:
+                    continue
+                args = info.get("cmdline") or []
+                command = " ".join(args).replace("\\", "/").casefold()
+                if target in command or "net.minecraft.client.main.main" in command:
+                    matches.append((float(info.get("create_time") or 0), int(info["pid"])))
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, TypeError, ValueError):
+                continue
+        if matches:
+            return max(matches)[1]
+        time.sleep(0.2)
+    raise LauncherError("Could not locate the Minecraft Java process for the WibsVerse SSO handoff.")
 
 
 class UpdateWorker(QThread):
@@ -288,14 +362,27 @@ class OfflineLoginWorker(QThread):
     succeeded = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, executable: str, root: Path, name: str):
+    def __init__(self, executable: str, root: Path, name: str, email: str, password: str):
         super().__init__()
         self.executable = executable
         self.root = root
         self.name = name
+        self.email = email
+        self.password = password
 
     def run(self):
+        account_uuid = ""
+        credential_key = ""
+        account_created = False
         try:
+            self.progressed.emit("Signing in to WibsVerse...")
+            web_session = WibsVerseWebSession()
+            account_html = web_session.login(self.email, self.password)
+            linked_name = web_session.linked_minecraft_username(account_html)
+            if linked_name and linked_name.casefold() != self.name.casefold():
+                raise WibsVerseAuthError("This WibsVerse account is already linked to a different Minecraft username.")
+            if not linked_name and not web_session.can_link_minecraft_profile(account_html):
+                raise WibsVerseAuthError("Could not determine whether this WibsVerse account already has a Minecraft profile linked.")
             ensure_instance(self.root)
             if not self.executable or not Path(self.executable).is_file():
                 self.progressed.emit("HeadlessMc was not found. Installing the official release...")
@@ -304,13 +391,46 @@ class OfflineLoginWorker(QThread):
                 ))
                 self.executable_ready.emit(self.executable)
             self.progressed.emit(f"Adding offline account {self.name}...")
-            create_hmc_offline_account(self.root, self.name)
+            account_uuid = str(uuid.uuid4())
+            account = create_hmc_offline_account(self.root, self.name, account_uuid)
+            account_created = True
+            credential_key = account_credential_key({"mode": "offline", "uuid": account_uuid})
+            save_password(credential_key, self.password)
             accounts = hmc_accounts(self.executable, self.root)
             if not any(account["name"] == self.name and account["mode"] == "offline" for account in accounts):
                 raise LauncherError("HeadlessMC did not create the offline account")
-            self.succeeded.emit(accounts)
+            self.succeeded.emit({
+                "accounts": accounts, "account": account, "email": self.email,
+                "minecraft_linked": bool(linked_name),
+            })
         except Exception as error:
+            if account_created:
+                try:
+                    remove_hmc_offline_account(self.root, self.name)
+                except Exception:
+                    pass
+            if credential_key:
+                delete_password(credential_key)
             self.failed.emit(f"{type(error).__name__}: {error}")
+
+
+class WibsVerseCredentialWorker(QThread):
+    succeeded = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, account_key: str, email: str, password: str):
+        super().__init__()
+        self.account_key = account_key
+        self.email = email
+        self.password = password
+
+    def run(self):
+        try:
+            WibsVerseWebSession().login(self.email, self.password)
+            save_password(self.account_key, self.password)
+            self.succeeded.emit(self.email)
+        except Exception as error:
+            self.failed.emit(str(error))
 
 
 class RemoveAccountWorker(QThread):
@@ -347,14 +467,23 @@ class LaunchWorker(QThread):
     succeeded = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, executable: str, root: Path, account_name: str, join_server: bool):
+    def __init__(
+        self, executable: str, root: Path, account_name: str, account_mode: str,
+        account_uuid: str, join_server: bool, wibsverse_email: str = "", wibsverse_password: str = "",
+    ):
         super().__init__()
         self.executable = executable
         self.root = root
         self.account_name = account_name
+        self.account_mode = account_mode
+        self.account_uuid = account_uuid
         self.join_server = join_server
+        self.wibsverse_email = wibsverse_email
+        self.wibsverse_password = wibsverse_password
 
     def run(self):
+        process = None
+        handoff = None
         try:
             ensure_instance(self.root)
             if not self.executable or not Path(self.executable).is_file():
@@ -374,12 +503,50 @@ class LaunchWorker(QThread):
             self.progressed.emit("Starting Minecraft headlessly through HeadlessMC...")
             log_path = app_dir() / "headlessmc-launch.log"
             log_path.parent.mkdir(parents=True, exist_ok=True)
+            java_properties = None
+            credential: GameAuthCredential | None = None
+            link_code = None
+            linked_name = None
+            if self.account_mode == "offline" and self.join_server:
+                self.progressed.emit("Authenticating this offline account with WibsVerse...")
+                credential = WibsVerseGameAuthClient().authenticate(self.account_name, self.wibsverse_password)
+                if credential.runtime_uuid.replace("-", "").casefold() != self.account_uuid.replace("-", "").casefold():
+                    raise LauncherError("WibsVerse returned a credential for a different Minecraft profile.")
+                web_session = WibsVerseWebSession()
+                account_html = web_session.login(self.wibsverse_email, self.wibsverse_password)
+                linked_name = web_session.linked_minecraft_username(account_html)
+                if linked_name and linked_name.casefold() != self.account_name.casefold():
+                    raise LauncherError("This WibsVerse account is already linked to a different Minecraft username.")
+                if not linked_name:
+                    if not web_session.can_link_minecraft_profile(account_html):
+                        raise LauncherError("Could not determine whether this WibsVerse account already has a Minecraft profile linked.")
+                    link_code = web_session.generate_link_code(self.wibsverse_password)
+                install_launcher_link_bridge(self.root)
+                handoff = SsoHandoff.create(self.root, self.account_uuid, self.account_name, SERVER)
+                if link_code:
+                    handoff.write_link_code(link_code.code, link_code.expires_at)
+                java_properties = {
+                    "wibs.sso.ipc": handoff.java_property,
+                    "wibs.autojoin": "true",
+                }
+                if link_code:
+                    java_properties["wibs.linkaccount.file"] = str(
+                        (handoff.directory / "link-code.json").resolve()
+                    ).replace("\\", "/")
+            elif self.account_mode == "offline":
+                java_properties = {"wibs.autojoin": "false"}
+            launch_env = hmc_environment(self.root, java_properties)
             log = log_path.open("ab")
             try:
+                launched_at = time.time()
                 process = subprocess.Popen(
-                    hmc_launch_command(self.executable, self.account_name, self.join_server),
+                    hmc_launch_command(
+                        self.executable,
+                        self.account_name,
+                        self.join_server and not (self.account_mode == "offline" and handoff is not None),
+                    ),
                     cwd=str(self.root),
-                    env=hmc_environment(self.root),
+                    env=launch_env,
                     stdout=log,
                     stderr=subprocess.STDOUT,
                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
@@ -388,8 +555,29 @@ class LaunchWorker(QThread):
                 log.close()
                 raise
             log.close()
-            self.succeeded.emit(process)
+            if handoff is not None and credential is not None:
+                self.progressed.emit("Completing WibsVerse SSO handoff...")
+                process_id = wait_for_minecraft_process_id(process.pid, game_dir(self.root), launched_at)
+                handoff.write_context(process_id)
+                if not handoff.wait_until_ready(45):
+                    raise LauncherError("WibsVerse SSO did not accept the launch context.")
+                handoff.write_credential(credential)
+                if not handoff.wait_until_consumed(45):
+                    raise LauncherError("Minecraft did not consume the WibsVerse SSO credential.")
+                if link_code:
+                    handoff.cleanup_auth_files()
+                else:
+                    handoff.cleanup()
+            self.succeeded.emit({
+                "process": process,
+                "sso_handoff": handoff if link_code else None,
+                "minecraft_linked": bool(linked_name),
+                "account_key": account_credential_key({"mode": self.account_mode, "uuid": self.account_uuid}),
+                "account_name": self.account_name,
+            } if handoff is not None else process)
         except Exception as error:
+            if handoff is not None:
+                handoff.cleanup()
             self.failed.emit(f"{type(error).__name__}: {error}")
 
 
@@ -553,6 +741,47 @@ class AccountHelpDialog(QDialog):
             self.status.setText(text)
 
 
+class AddOfflineAccountDialog(QDialog):
+    def __init__(self, parent: QWidget):
+        super().__init__(parent)
+        self.setWindowTitle("Add Offline Account")
+        self.setMinimumWidth(420)
+        self.setWindowFlag(Qt.WindowType.WindowContextHelpButtonHint, False)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(26, 24, 26, 24)
+        layout.setSpacing(14)
+        title = QLabel("Connect an Offline Account")
+        title.setObjectName("updateTitle")
+        layout.addWidget(title)
+        explanation = QLabel(
+            "Sign in with the WibsVerse account you have linked to this Minecraft username. "
+            "The launcher stores its password in your operating system's credential vault."
+        )
+        explanation.setWordWrap(True)
+        layout.addWidget(explanation)
+        form = QFormLayout()
+        self.minecraft_name = QLineEdit()
+        self.minecraft_name.setPlaceholderText("Offline Minecraft username")
+        form.addRow("Minecraft username", self.minecraft_name)
+        self.email = QLineEdit()
+        self.email.setPlaceholderText("WibsVerse email")
+        form.addRow("WibsVerse email", self.email)
+        self.password = QLineEdit()
+        self.password.setEchoMode(QLineEdit.EchoMode.Password)
+        self.password.setPlaceholderText("WibsVerse password")
+        form.addRow("WibsVerse password", self.password)
+        layout.addLayout(form)
+        self.status = QLabel("")
+        self.status.setObjectName("status")
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+        buttons = QDialogButtonBox()
+        self.add_button = buttons.addButton("Sign in & Add", QDialogButtonBox.ButtonRole.AcceptRole)
+        buttons.addButton("Cancel", QDialogButtonBox.ButtonRole.RejectRole).clicked.connect(self.reject)
+        self.add_button.clicked.connect(self.accept)
+        layout.addWidget(buttons)
+
+
 class Launcher(QWidget):
     def __init__(self):
         super().__init__()
@@ -575,8 +804,14 @@ class Launcher(QWidget):
         self.login_task: LoginWorker | None = None
         self.offline_task: OfflineLoginWorker | None = None
         self.remove_account_task: RemoveAccountWorker | None = None
+        self.wibsverse_task: WibsVerseCredentialWorker | None = None
         self.launch_task: LaunchWorker | None = None
         self.game_process: subprocess.Popen | None = None
+        self._console_file_identity: tuple[int, int] | None = None
+        self._console_offset = 0
+        self._console_initialized = False
+        self.pending_link_handoff: SsoHandoff | None = None
+        self.pending_link_account_key = ""
         self.update_dialog: UpdateDialog | None = None
         self.queued_release: Release | None = None
         self.game_icon_task: GameIconWorker | None = None
@@ -599,6 +834,12 @@ class Launcher(QWidget):
         self.setMinimumSize(900, 640)
         self._drag_offset = None
         self._ui()
+        self.console_timer = QTimer(self)
+        self.console_timer.setInterval(500)
+        self.console_timer.timeout.connect(self._poll_console_log)
+        self.link_watch_timer = QTimer(self)
+        self.link_watch_timer.setInterval(500)
+        self.link_watch_timer.timeout.connect(self._poll_link_status)
         self._refresh_accounts()
         self.update_installed_label()
         QTimer.singleShot(180, self._startup)
@@ -679,6 +920,10 @@ class Launcher(QWidget):
           QToolButton#settings { font-size:14pt; padding:4px; }
           QToolButton#textLink { color:#FF92C4; background:transparent; border:0; padding:0; text-align:left; font-size:9pt; }
           QToolButton#textLink:hover { color:#FFB2D4; background:transparent; text-decoration:underline; }
+          QToolButton#navTab { color:#BAA6B4; background:transparent; border:0; border-bottom:2px solid transparent;
+              border-radius:0; padding:10px 14px; font-weight:600; }
+          QToolButton#navTab:hover { color:#FFF1DF; background:rgba(57,39,51,100); }
+          QToolButton#navTab:checked { color:#FFF1DF; border-bottom:2px solid #ED4194; }
           QToolButton#windowControl { background:transparent; border:0; border-radius:0; padding:0; color:#BAA6B4; }
           QToolButton#windowControl:hover { background:#392733; color:#FFF1DF; }
           QCheckBox { spacing:10px; color:#FFF1DF; font-size:9pt; }
@@ -692,6 +937,8 @@ class Launcher(QWidget):
           QProgressBar::chunk { background:#D9439F; border-radius:6px; }
           QDialog { background:#1A1B27; }
           QLineEdit { background:#2A2936; border:1px solid #54495B; border-radius:8px; padding:12px; }
+          QPlainTextEdit#consoleOutput { background:#100E14; color:#E6DDE5; border:1px solid #392733;
+              border-radius:8px; padding:8px; font:9pt "Consolas"; selection-background-color:#8D3267; }
         ''')
         outer = QVBoxLayout(self)
         outer.setContentsMargins(1, 0, 1, 1)
@@ -733,19 +980,21 @@ class Launcher(QWidget):
         logo.setOpenExternalLinks(True)
         logo.setCursor(Qt.CursorShape.PointingHandCursor)
         toolbar.addWidget(logo)
-        game_tab = QFrame()
-        game_tab.setStyleSheet("border-bottom:2px solid #ED4194;")
-        game_tab_layout = QHBoxLayout(game_tab)
-        game_tab_layout.setContentsMargins(12, 0, 12, 0)
-        game_tab_layout.setSpacing(10)
-        sword = QLabel()
-        sword.setPixmap(QIcon(str(ASSET_DIR / "swords.svg")).pixmap(17, 17))
-        game_tab_layout.addWidget(sword)
-        game_name = QLabel("Demon Slayer")
-        game_name.setStyleSheet("color:#FFF1DF; font-weight:600;")
-        game_tab_layout.addWidget(game_name)
-        game_tab_layout.addStretch()
-        toolbar.addWidget(game_tab)
+        self.play_tab = QToolButton()
+        self.play_tab.setObjectName("navTab")
+        self.play_tab.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.play_tab.setIcon(QIcon(str(ASSET_DIR / "swords.svg")))
+        self.play_tab.setText("Demon Slayer")
+        self.play_tab.setCheckable(True)
+        self.play_tab.setChecked(True)
+        self.play_tab.clicked.connect(lambda: self._show_launcher_page(0))
+        toolbar.addWidget(self.play_tab)
+        self.console_tab = QToolButton()
+        self.console_tab.setObjectName("navTab")
+        self.console_tab.setText("Console")
+        self.console_tab.setCheckable(True)
+        self.console_tab.clicked.connect(lambda: self._show_launcher_page(1))
+        toolbar.addWidget(self.console_tab)
         toolbar.addStretch()
         self.account_button = QToolButton()
         self.account_button.setObjectName("account")
@@ -818,8 +1067,6 @@ class Launcher(QWidget):
         caption = QLabel("TWO PATHS. ONE DESTINY.")
         caption.setObjectName("caption")
         showcase_layout.addWidget(caption, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom)
-        outer.addWidget(showcase, 1)
-
         panel = QFrame()
         panel.setObjectName("launchPanel")
         panel.setFixedHeight(122)
@@ -881,7 +1128,46 @@ class Launcher(QWidget):
         self.add_account_button.clicked.connect(self.show_add_account_dialog)
         self.add_account_button.hide()
         action_column.addWidget(self.add_account_button)
-        outer.addWidget(panel)
+        self.page_stack = QStackedWidget()
+        home_page = QWidget()
+        home_layout = QVBoxLayout(home_page)
+        home_layout.setContentsMargins(0, 0, 0, 0)
+        home_layout.setSpacing(0)
+        home_layout.addWidget(showcase, 1)
+        home_layout.addWidget(panel)
+        self.page_stack.addWidget(home_page)
+
+        console_page = QWidget()
+        console_layout = QVBoxLayout(console_page)
+        console_layout.setContentsMargins(34, 24, 34, 24)
+        console_layout.setSpacing(12)
+        console_header = QHBoxLayout()
+        console_heading = QLabel("GAME CONSOLE")
+        console_heading.setObjectName("category")
+        console_header.addWidget(console_heading)
+        console_header.addStretch()
+        self.console_clear_button = QPushButton("Clear Console")
+        self.console_clear_button.clicked.connect(self._clear_console)
+        console_header.addWidget(self.console_clear_button)
+        self.console_copy_button = QPushButton("Copy to Clipboard")
+        self.console_copy_button.clicked.connect(self._copy_console)
+        console_header.addWidget(self.console_copy_button)
+        console_layout.addLayout(console_header)
+        self.console_log_label = QLabel(str(game_dir(self.root) / "logs" / "latest.log"))
+        self.console_log_label.setObjectName("muted")
+        self.console_log_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        console_layout.addWidget(self.console_log_label)
+        self.console_output = QPlainTextEdit()
+        self.console_output.setObjectName("consoleOutput")
+        self.console_output.setReadOnly(True)
+        self.console_output.setMaximumBlockCount(5000)
+        self.console_output.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        console_layout.addWidget(self.console_output, 1)
+        self.console_status = QLabel("Waiting for Minecraft log output…")
+        self.console_status.setObjectName("muted")
+        console_layout.addWidget(self.console_status)
+        self.page_stack.addWidget(console_page)
+        outer.addWidget(self.page_stack, 1)
 
         footer_frame = QFrame()
         footer_frame.setObjectName("footer")
@@ -911,6 +1197,136 @@ class Launcher(QWidget):
 
     def _toggle_maximized(self):
         self.showNormal() if self.isMaximized() else self.showMaximized()
+
+    def _show_launcher_page(self, index: int):
+        self.page_stack.setCurrentIndex(index)
+        self.play_tab.setChecked(index == 0)
+        self.console_tab.setChecked(index == 1)
+        if index == 1:
+            self.console_timer.start()
+            self._poll_console_log()
+        else:
+            self.console_timer.stop()
+
+    def _clear_console(self):
+        self.console_output.clear()
+
+    def _copy_console(self):
+        QApplication.clipboard().setText(self.console_output.toPlainText())
+
+    def _prepare_console_for_launch(self):
+        """Start a fresh visible console without modifying Minecraft's log file."""
+        self.console_output.clear()
+        path = game_dir(self.root) / "logs" / "latest.log"
+        try:
+            info = path.stat()
+        except OSError:
+            self._console_file_identity = None
+            self._console_offset = 0
+            self._console_initialized = True
+            return
+        self._console_file_identity = (info.st_dev, info.st_ino)
+        self._console_offset = info.st_size
+        self._console_initialized = True
+
+    def _append_console_output(self, text: str):
+        if not text:
+            return
+        scrollbar = self.console_output.verticalScrollBar()
+        follow = scrollbar.value() >= scrollbar.maximum() - 2
+        cursor = self.console_output.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        cursor.insertText(text)
+        self.console_output.setTextCursor(cursor)
+        if follow:
+            self.console_output.ensureCursorVisible()
+
+    def _poll_console_log(self):
+        if self.page_stack.currentIndex() != 1:
+            return
+        path = game_dir(self.root) / "logs" / "latest.log"
+        self.console_log_label.setText(str(path))
+        running = self.game_process is not None and self.game_process.poll() is None
+        self.console_tab.setText("Console • Running" if running else "Console")
+        try:
+            info = path.stat()
+        except OSError:
+            self.console_status.setText(
+                "Waiting for Minecraft to create latest.log…" if running else "No Minecraft log has been created yet."
+            )
+            return
+
+        identity = (info.st_dev, info.st_ino)
+        rotated = self._console_file_identity is not None and identity != self._console_file_identity
+        truncated = self._console_file_identity == identity and info.st_size < self._console_offset
+        if rotated or truncated:
+            self.console_output.clear()
+            self._console_offset = 0
+            self._console_initialized = True
+        elif self._console_file_identity is None:
+            self._console_offset = 0
+        self._console_file_identity = identity
+
+        try:
+            with path.open("rb") as log_file:
+                if not self._console_initialized:
+                    # On launcher startup, show a bounded tail of the previous run.
+                    start = max(0, info.st_size - 512 * 1024)
+                    log_file.seek(start)
+                    if start:
+                        log_file.readline()
+                    self._console_initialized = True
+                else:
+                    log_file.seek(self._console_offset)
+                chunk = log_file.read(256 * 1024)
+                self._console_offset = log_file.tell()
+            self._append_console_output(chunk.decode("utf-8", errors="replace"))
+        except OSError:
+            # The game may replace/rotate latest.log while it is being read.
+            pass
+
+        self.console_status.setText(
+            "Minecraft is running · Live log" if running else "Latest game log"
+        )
+
+    def _poll_link_status(self):
+        handoff = self.pending_link_handoff
+        if handoff is None:
+            self.link_watch_timer.stop()
+            return
+        status_path = handoff.directory / "link-status.json"
+        try:
+            status = load_json(status_path, {})
+        except (OSError, ValueError, TypeError):
+            status = {}
+        if isinstance(status, dict) and status.get("session_id") == handoff.session_id:
+            if status.get("status") == "linked":
+                profiles = self._account_profiles()
+                profile = profiles.get(self.pending_link_account_key)
+                if isinstance(profile, dict):
+                    profile["minecraft_linked"] = True
+                    profile["linked_minecraft_username"] = status.get("minecraft_username", "")
+                    profiles[self.pending_link_account_key] = profile
+                    self._persist()
+                self.status.setText("WibsVerse Minecraft account linked.")
+                handoff.cleanup()
+                self.pending_link_handoff = None
+                self.pending_link_account_key = ""
+                self.link_watch_timer.stop()
+                return
+            if status.get("status") == "rejected":
+                self.status.setText("WibsVerse did not accept the Minecraft link code. Re-link the account in settings.")
+                handoff.cleanup()
+                self.pending_link_handoff = None
+                self.pending_link_account_key = ""
+                self.link_watch_timer.stop()
+                return
+        if handoff.link_code_expires_at_epoch_seconds and handoff.link_code_expires_at_epoch_seconds < int(time.time()):
+            self.status.setText("WibsVerse link code expired before linking completed. Launch again to retry.")
+            handoff.cleanup()
+            self.pending_link_handoff = None
+            self.pending_link_account_key = ""
+            self.link_watch_timer.stop()
 
     def _startup(self):
         old_root = legacy_prism_data_dir()
@@ -1009,6 +1425,7 @@ class Launcher(QWidget):
         menu.addAction("+  Add account...").triggered.connect(self.show_add_account_dialog)
         if available:
             menu.addAction("Remove account...").triggered.connect(self.remove_account)
+            menu.addAction("Account settings...").triggered.connect(self.edit_account_settings)
         menu.addAction("Refresh accounts").triggered.connect(self._refresh_accounts)
 
     def _choose_account(self, account: dict):
@@ -1091,19 +1508,17 @@ class Launcher(QWidget):
     def add_offline(self):
         if self.login_task is not None or self.offline_task is not None:
             return
-        name, accepted = QInputDialog.getText(
-            self, "Add Offline Account", "Enter the offline player name:"
-        )
-        name = name.strip()
-        if not accepted or not name:
+        dialog = AddOfflineAccountDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        dialog = AccountHelpDialog(
-            self,
-            "Add Offline Account",
-            "HeadlessMc will create this tokenless account using the player name you entered.",
-        )
+        name = dialog.minecraft_name.text().strip()
+        email = dialog.email.text().strip()
+        password = dialog.password.text()
+        if not name or not email or not password:
+            QMessageBox.warning(self, "Missing account details", "Enter a Minecraft username, WibsVerse email, and password.")
+            return
         self.account_dialog = dialog
-        self.offline_task = OfflineLoginWorker(self.hmc_exe, self.root, name)
+        self.offline_task = OfflineLoginWorker(self.hmc_exe, self.root, name, email, password)
         self.offline_task.progressed.connect(dialog.status.setText)
         self.offline_task.executable_ready.connect(self._hmc_executable_ready)
         self.offline_task.succeeded.connect(self._offline_login_succeeded)
@@ -1111,11 +1526,19 @@ class Launcher(QWidget):
         self.offline_task.finished.connect(self._offline_login_finished)
         self._set_busy(True)
         self.offline_task.start()
-        dialog.exec()
+        dialog.show()
 
-    def _offline_login_succeeded(self, _accounts: object):
+    def _offline_login_succeeded(self, result: object):
+        if isinstance(result, dict) and isinstance(result.get("account"), dict):
+            account = result["account"]
+            key = account_credential_key({"mode": "offline", "uuid": account["uuid"]})
+            self._account_profiles()[key] = {
+                "email": result.get("email", ""),
+                "credentials_saved": True,
+                "minecraft_linked": bool(result.get("minecraft_linked")),
+            }
         self._refresh_accounts()
-        self.status.setText("Offline account added. Select it from the account menu.")
+        self.status.setText("WibsVerse-connected offline account added.")
         if hasattr(self, "account_dialog"):
             self.account_dialog.accept()
 
@@ -1147,6 +1570,7 @@ class Launcher(QWidget):
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
+        self.pending_removed_accounts = [entry for entry in available if entry["name"] == name]
         self.remove_account_task = RemoveAccountWorker(self.hmc_exe, self.root, name)
         self.remove_account_task.executable_ready.connect(self._hmc_executable_ready)
         self.remove_account_task.succeeded.connect(self._account_removed)
@@ -1157,6 +1581,11 @@ class Launcher(QWidget):
         self.remove_account_task.start()
 
     def _account_removed(self):
+        for account in getattr(self, "pending_removed_accounts", []):
+            key = account_credential_key(account)
+            delete_password(key)
+            self._account_profiles().pop(key, None)
+        self.pending_removed_accounts = []
         self.selection = {}
         self._refresh_accounts()
         self.status.setText("Account removed.")
@@ -1191,7 +1620,7 @@ class Launcher(QWidget):
     def _set_busy(self, busy: bool):
         installed = bool(read_installed(self.root).get("version"))
         active = busy or self.login_task is not None or self.offline_task is not None \
-            or self.remove_account_task is not None or self.launch_task is not None
+            or self.remove_account_task is not None or self.wibsverse_task is not None or self.launch_task is not None
         self.play_button.setEnabled(not active and installed and self._has_accounts)
         self.add_account_button.setEnabled(not active)
         self.settings_button.setEnabled(not active)
@@ -1380,6 +1809,9 @@ class Launcher(QWidget):
     def play(self):
         if self.task is not None:
             return
+        if self.game_process is not None and self.game_process.poll() is None:
+            QMessageBox.information(self, "Minecraft is already running", "Close the current game before launching another account.")
+            return
         if not read_installed(self.root).get("version"):
             QMessageBox.warning(self, "Not installed", "The modpack must be installed before playing.")
             return
@@ -1390,9 +1822,28 @@ class Launcher(QWidget):
             return
         if self.launch_task is not None:
             return
+        account = dict(self.selection)
+        wibsverse_email = ""
+        wibsverse_password = ""
+        if account.get("mode") == "offline":
+            profile = self._account_profile(account)
+            wibsverse_email = str(profile.get("email") or "")
+            try:
+                wibsverse_password = load_password(account_credential_key(account)) or ""
+            except WibsVerseAuthError as error:
+                QMessageBox.warning(self, "WibsVerse account required", str(error))
+                return
+            if not wibsverse_email or not wibsverse_password:
+                QMessageBox.information(
+                    self, "Connect a WibsVerse account",
+                    "Offline accounts need a WibsVerse account. Add its sign-in in Account menu → Account settings.",
+                )
+                self.edit_account_settings()
+                return
         self._persist()
         self.launch_task = LaunchWorker(
-            self.hmc_exe, self.root, name, self.server_checkbox.isChecked()
+            self.hmc_exe, self.root, name, account["mode"], account.get("uuid", ""),
+            self.server_checkbox.isChecked(), wibsverse_email, wibsverse_password,
         )
         self.launch_task.progressed.connect(self.status.setText)
         self.launch_task.executable_ready.connect(self._hmc_executable_ready)
@@ -1404,10 +1855,29 @@ class Launcher(QWidget):
         self.launch_task.start()
 
     def _launch_succeeded(self, process: object):
-        self.game_process = process
+        result = process if isinstance(process, dict) else {}
+        game_process = result.get("process") if result else process
+        if not isinstance(game_process, subprocess.Popen):
+            self._launch_failed("HeadlessMc returned an invalid Minecraft process handle.")
+            return
+        self.game_process = game_process
+        self._prepare_console_for_launch()
+        self.console_tab.setText("Console • Running")
+        if result.get("minecraft_linked"):
+            key = str(result.get("account_key") or account_credential_key(self.selection))
+            profile = dict(self._account_profiles().get(key) or {})
+            profile["minecraft_linked"] = True
+            profile["linked_minecraft_username"] = result.get("account_name", self.selection.get("name", ""))
+            self._account_profiles()[key] = profile
+            self._persist()
+        handoff = result.get("sso_handoff")
+        if isinstance(handoff, SsoHandoff):
+            self.pending_link_handoff = handoff
+            self.pending_link_account_key = str(result.get("account_key") or account_credential_key(self.selection))
+            self.link_watch_timer.start()
         icon_file = game_icon_file()
-        if icon_file is not None and isinstance(process, subprocess.Popen):
-            self.game_icon_task = GameIconWorker(process.pid, icon_file)
+        if icon_file is not None:
+            self.game_icon_task = GameIconWorker(game_process.pid, icon_file)
             self.game_icon_task.finished.connect(self._game_icon_finished)
             self.game_icon_task.start()
         self.status.setText("Minecraft is starting through HeadlessMc. First launch may download Forge and libraries.")
@@ -1426,12 +1896,14 @@ class Launcher(QWidget):
     def closeEvent(self, event):
         if (self.task is not None or self.migration_task is not None
                 or self.login_task is not None or self.offline_task is not None
-                or self.remove_account_task is not None or self.launch_task is not None
+                or self.remove_account_task is not None or self.wibsverse_task is not None or self.launch_task is not None
                 or self.launcher_release_task is not None or self.launcher_download_task is not None):
             event.ignore()
             QMessageBox.information(self, "Updating", "Please keep the launcher open until the current operation finishes.")
             return
         self._persist()
+        self.console_timer.stop()
+        self.link_watch_timer.stop()
         # Public-skin HTTP workers must finish before QApplication tears down Qt objects.
         for worker in list(self._avatar_workers):
             if worker.isRunning():
@@ -1442,6 +1914,96 @@ class Launcher(QWidget):
         application = QApplication.instance()
         if application is not None:
             QTimer.singleShot(0, application.quit)
+
+    def _account_profiles(self) -> dict:
+        profiles = self.settings.get("account_profiles")
+        if not isinstance(profiles, dict):
+            profiles = {}
+            self.settings["account_profiles"] = profiles
+        return profiles
+
+    def _account_profile(self, account: dict | None = None) -> dict:
+        account = account or self.selection
+        try:
+            key = account_credential_key(account)
+        except LauncherError:
+            return {}
+        profile = self._account_profiles().get(key)
+        return profile if isinstance(profile, dict) else {}
+
+    def edit_account_settings(self):
+        account = dict(self.selection)
+        if account.get("mode") not in {"offline", "microsoft"}:
+            QMessageBox.information(self, "Account settings", "Choose a Minecraft account first.")
+            return
+        if self.wibsverse_task is not None:
+            return
+        key = account_credential_key(account)
+        profile = self._account_profile(account)
+        email, accepted = QInputDialog.getText(
+            self, "WibsVerse Account", "WibsVerse email:", text=str(profile.get("email") or "")
+        )
+        if not accepted:
+            return
+        email = email.strip()
+        if not email:
+            if account["mode"] == "offline":
+                QMessageBox.warning(self, "WibsVerse account required", "Offline accounts must have a WibsVerse account.")
+                return
+            answer = QMessageBox.question(
+                self, "Unlink WibsVerse Account", "Remove the optional WibsVerse login from this Microsoft account?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                delete_password(key)
+                self._account_profiles().pop(key, None)
+                self._persist()
+                self.status.setText("WibsVerse account unlinked.")
+            return
+        password, accepted = QInputDialog.getText(
+            self, "WibsVerse Account", "WibsVerse password (leave blank to keep the saved password):",
+            QLineEdit.EchoMode.Password,
+        )
+        if not accepted:
+            return
+        if not password:
+            try:
+                password = load_password(key) or ""
+            except WibsVerseAuthError as error:
+                QMessageBox.warning(self, "WibsVerse account", str(error))
+                return
+        if not password:
+            QMessageBox.warning(self, "WibsVerse account", "Enter a WibsVerse password to link this account.")
+            return
+        self.wibsverse_task = WibsVerseCredentialWorker(key, email, password)
+        self.wibsverse_task.succeeded.connect(
+            lambda saved_email, a=account: self._wibsverse_credentials_saved(a, saved_email)
+        )
+        self.wibsverse_task.failed.connect(self._wibsverse_credentials_failed)
+        self.wibsverse_task.finished.connect(self._wibsverse_credentials_finished)
+        self._set_busy(True)
+        self.status.setText("Verifying WibsVerse account...")
+        self.wibsverse_task.start()
+
+    def _wibsverse_credentials_saved(self, account: dict, email: str):
+        key = account_credential_key(account)
+        profiles = self._account_profiles()
+        profile = profiles.get(key)
+        profile = dict(profile) if isinstance(profile, dict) else {}
+        profile["email"] = email
+        profile["credentials_saved"] = True
+        profiles[key] = profile
+        self._persist()
+        self.status.setText("WibsVerse account saved for this Minecraft account.")
+
+    def _wibsverse_credentials_failed(self, message: str):
+        self.status.setText("WibsVerse sign-in failed.")
+        QMessageBox.warning(self, "WibsVerse sign-in failed", message)
+
+    def _wibsverse_credentials_finished(self):
+        self.wibsverse_task = None
+        self._set_busy(False)
 
 
 def main():

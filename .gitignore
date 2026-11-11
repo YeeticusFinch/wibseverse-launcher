@@ -1,6 +1,8 @@
 .build-venv/
 build/
 build-*/
+.gradle/
+launcher-link-bridge/run/
 dist/
 *.spec
 __pycache__/

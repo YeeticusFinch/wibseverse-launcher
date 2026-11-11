@@ -1,0 +1,53 @@
+alt-svc
+h3=":443"; ma=86400
+cache-control
+no-cache, private
+cf-cache-status
+DYNAMIC
+cf-ray
+a58dd9952d4561e8-YYZ
+content-security-policy
+frame-ancestors 'self'; object-src 'none'; base-uri 'self'
+content-type
+text/html; charset=utf-8
+date
+Wed, 11 Nov 2026 14:05:06 GMT
+location
+https://www.wibsverse.com/email/verify
+nel
+{"report_to":"cf-nel","success_fraction":0.0,"max_age":604800}
+permissions-policy
+camera=(), geolocation=(), microphone=(), payment=(), usb=()
+priority
+u=0,i
+referrer-policy
+strict-origin-when-cross-origin
+referrer-policy
+strict-origin-when-cross-origin
+report-to
+{"group":"cf-nel","max_age":604800,"endpoints":[{"url":"https://a.nel.cloudflare.com/report/v4?s=pkYO9o61Cad736k%2FmGPiCnInfTvwxZfxr899HAxHnpA4JtYvcJDujTNCI73rv%2BWQJlne0MbhW4LY5R7ubRxVvJJgZzw9bYoA2bYFWWJiDGJMVl95UAUC1vbBEDHtWXku1jp6yw%3D%3D"}]}
+server
+cloudflare
+server-timing
+cfCacheStatus;desc="DYNAMIC"
+server-timing
+cfEdge;dur=7,cfOrigin;dur=141
+server-timing
+cfExtPri
+set-cookie
+XSRF-TOKEN=eyJpdiI6IkxrN1hyQjd1a1IzRVZoVkZidWxNeUE9PSIsInZhbHVlIjoiNVhXdktRU0UwQVJTSjUvVHU2ZlhkbTVOWG1nUS9nT0hFMU43angzV3dkdUljVVFOMzVGR3pxakF5aENwMWtBRjJyWGlqaFFScTlVS3I4bWxtUEVnN0o0dXREZGNlRXNCYkRyRXM3ZlBqdVNkemVGaDQvZkN3RFNQam56SUFGUnoiLCJtYWMiOiI1ZWM0ZDA3ZTA4ODU2MDVlODM3MzYxMzdhNjY3M2RiZTE3MDdkODZlMjBlNDdhYWM2MDU3ZDk2MDNiNGQ1M2Y4IiwidGFnIjoiIn0%3D; expires=Wed, 11 Nov 2026 16:05:06 GMT; Max-Age=7200; path=/; secure; samesite=lax
+set-cookie
+wibs-verse-session=eyJpdiI6IlUvNGNNT0o2c1hFZmtHRm56YVFKL2c9PSIsInZhbHVlIjoiUy94eE5LYmlLK2JZNHJwY3VLSjFKcU1LVkxDblNIYXBXVXRJVDVlVGc4djAweGk3N05XcW82L2NjaEVJTU1GRFB0YnhPeWFoUi9kelBmREt6ODhzNkZ5RXVQQkROUTlEMThIU1lUSnl4MTNJYjVSZmRXWG5kYkhFQUNwSUZsMWQiLCJtYWMiOiJjNzBlNDVlZjYxN2UxZDE4MDgxNjQyN2U4NTNiMTc5NmY1NGU3NGU3Mjg3N2IwMjUyNzAwMTkxNDdiYzE3MmY0IiwidGFnIjoiIn0%3D; expires=Wed, 11 Nov 2026 16:05:06 GMT; Max-Age=7200; path=/; secure; httponly; samesite=lax
+strict-transport-security
+max-age=31536000; includeSubDomains
+x-content-type-options
+nosniff
+x-content-type-options
+nosniff
+x-frame-options
+SAMEORIGIN
+x-ratelimit-limit
+3
+
+x-ratelimit-remaining
+2

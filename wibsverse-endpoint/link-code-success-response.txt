@@ -1,0 +1,52 @@
+alt-svc
+h3=":443"; ma=86400
+cache-control
+no-cache, private
+cf-cache-status
+DYNAMIC
+cf-ray
+a58dfbb23c3eebb9-YYZ
+content-security-policy
+frame-ancestors 'self'; object-src 'none'; base-uri 'self'
+content-type
+text/html; charset=utf-8
+date
+Wed, 11 Nov 2026 14:28:24 GMT
+location
+https://www.wibsverse.com/account#minecraft-identities
+nel
+{"report_to":"cf-nel","success_fraction":0.0,"max_age":604800}
+permissions-policy
+camera=(), geolocation=(), microphone=(), payment=(), usb=()
+priority
+u=0,i
+referrer-policy
+strict-origin-when-cross-origin
+referrer-policy
+strict-origin-when-cross-origin
+report-to
+{"group":"cf-nel","max_age":604800,"endpoints":[{"url":"https://a.nel.cloudflare.com/report/v4?s=s3IHkIL4tFy%2BXCuLg44zeY1wQYvTXEGoT8%2FPytbh4u769AsbsN%2BWSel0%2Bk%2FDXMNvAB81vKhOU790wV4ZmfBuK8xTthVCSC%2FWoJt%2F1qexaCihJZ48EpmcLEQPsMIV6xVirxj1xQ%3D%3D"}]}
+server
+cloudflare
+server-timing
+cfCacheStatus;desc="DYNAMIC"
+server-timing
+cfEdge;dur=16,cfOrigin;dur=477
+server-timing
+cfExtPri
+set-cookie
+XSRF-TOKEN=eyJpdiI6IlR1K3JsNEo3bVJzRi8rZ1NSL1BvR0E9PSIsInZhbHVlIjoieExWeW4xQmxXdnlqNStHV3o5R3pHek5vWFh2SEFJQS8vcVFFQnJ1OElFL2h0Y3MzalNKdGNYWGJscTlUUjZFYnFmRkIrT2VUSzk3MGpGSmNFOFk0QklVbzZhWkRFNE5PQzd3bnEyUldWQTFLUzlsSWlSemo2cVFRUlpVU05wL0siLCJtYWMiOiIwYTFmMGVmZTc3ZGZkNzUyNjVkNTg3ODY0ZThhYTg5ZTE2N2FiN2FmOGNlN2IwNDQyODNlZTc3Yzk2Nzg2MTBiIiwidGFnIjoiIn0%3D; expires=Wed, 11 Nov 2026 16:28:24 GMT; Max-Age=7200; path=/; secure; samesite=lax
+set-cookie
+wibs-verse-session=eyJpdiI6ImhqeXdiMFFrekpYaTlQeUwxY3lpbnc9PSIsInZhbHVlIjoiR0JPQStBTnZzSDdyWld6SlJDTy9OVmc4OWNZZUtkT294bERWVEoxS3hPRHJDckwrN05GdG9hSGl1MndZOE1sU1VJRVVPTTZ1cm5iNHpEd0RXVTBGTUY4YUtkWEl1K2xRZkVualVQanp6RWdFUWdhVHBueGNFa05jbE55Z2pmZGciLCJtYWMiOiIyZGU2NmUyNTVmMmU5ZWY4NzdiYWNmZmIwZTI0YmI2ZjkyMDczZmZjNjgxMzhmZGU0NzhmN2JmNTQ4ZjM4ODA3IiwidGFnIjoiIn0%3D; expires=Wed, 11 Nov 2026 16:28:24 GMT; Max-Age=7200; path=/; secure; httponly; samesite=lax
+strict-transport-security
+max-age=31536000; includeSubDomains
+x-content-type-options
+nosniff
+x-content-type-options
+nosniff
+x-frame-options
+SAMEORIGIN
+x-ratelimit-limit
+3
+x-ratelimit-remaining
+2

@@ -1,0 +1,25 @@
+modLoader="javafml"
+loaderVersion="[47,)"
+license="All Rights Reserved"
+
+[[mods]]
+modId="wibsverse_launcher_bridge"
+version="1.0.0"
+displayName="WibsVerse Launcher Link Bridge"
+authors="WibsVerse"
+description='''Connects the WibsVerse Launcher's single-use Minecraft link code to the cracked-account auth prompt.'''
+displayTest="IGNORE_ALL_VERSION"
+
+[[dependencies.wibsverse_launcher_bridge]]
+modId="forge"
+mandatory=true
+versionRange="[47.0.0,)"
+ordering="NONE"
+side="CLIENT"
+
+[[dependencies.wibsverse_launcher_bridge]]
+modId="minecraft"
+mandatory=true
+versionRange="[1.20.1]"
+ordering="NONE"
+side="CLIENT"
