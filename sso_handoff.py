@@ -123,7 +123,7 @@ class SsoHandoff:
             directory.chmod(0o700)
         now = int(time.time())
         nonce = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii").rstrip("=")
-        expiry = now + 60
+        expiry = now + 600
         digest = context_digest(session, nonce, 0, runtime_uuid.lower(), username, target_host.lower(), target_port, now, expiry)
         return cls(directory, session, nonce, runtime_uuid.lower(), username, target_host.lower(), target_port, expiry, digest)
 
@@ -133,7 +133,7 @@ class SsoHandoff:
 
     def write_context(self, process_id: int):
         now = int(time.time())
-        expiry = now + 60
+        expiry = now + 600
         self.expires_at_epoch_seconds = expiry
         if process_id <= 0:
             raise SsoHandoffError("The Minecraft process ID is invalid for SSO IPC.")

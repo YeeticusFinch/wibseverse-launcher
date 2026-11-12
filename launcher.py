@@ -10,7 +10,6 @@ import struct
 import subprocess
 import sys
 import time
-import uuid
 from ctypes import wintypes
 from pathlib import Path
 
@@ -391,10 +390,9 @@ class OfflineLoginWorker(QThread):
                 ))
                 self.executable_ready.emit(self.executable)
             self.progressed.emit(f"Adding offline account {self.name}...")
-            account_uuid = str(uuid.uuid4())
-            account = create_hmc_offline_account(self.root, self.name, account_uuid)
+            account = create_hmc_offline_account(self.root, self.name)
             account_created = True
-            credential_key = account_credential_key({"mode": "offline", "uuid": account_uuid})
+            credential_key = account_credential_key({"mode": "offline", "uuid": account["uuid"]})
             save_password(credential_key, self.password)
             accounts = hmc_accounts(self.executable, self.root)
             if not any(account["name"] == self.name and account["mode"] == "offline" for account in accounts):
@@ -418,15 +416,22 @@ class WibsVerseCredentialWorker(QThread):
     succeeded = Signal(str)
     failed = Signal(str)
 
-    def __init__(self, account_key: str, email: str, password: str):
+    def __init__(self, account_key: str, minecraft_username: str, email: str, password: str):
         super().__init__()
         self.account_key = account_key
+        self.minecraft_username = minecraft_username
         self.email = email
         self.password = password
 
     def run(self):
         try:
-            WibsVerseWebSession().login(self.email, self.password)
+            session = WibsVerseWebSession()
+            html = session.login(self.email, self.password)
+            linked_name = session.linked_minecraft_username(html)
+            if linked_name and linked_name.casefold() != self.minecraft_username.casefold():
+                raise WibsVerseAuthError("This WibsVerse account is already linked to a different Minecraft username.")
+            if not linked_name and not session.can_link_minecraft_profile(html):
+                raise WibsVerseAuthError("Could not determine this WibsVerse account's Minecraft link status.")
             save_password(self.account_key, self.password)
             self.succeeded.emit(self.email)
         except Exception as error:
@@ -507,29 +512,26 @@ class LaunchWorker(QThread):
             credential: GameAuthCredential | None = None
             link_code = None
             linked_name = None
+            web_session = None
+            needs_link = False
             if self.account_mode == "offline" and self.join_server:
-                self.progressed.emit("Authenticating this offline account with WibsVerse...")
-                credential = WibsVerseGameAuthClient().authenticate(self.account_name, self.wibsverse_password)
-                if credential.runtime_uuid.replace("-", "").casefold() != self.account_uuid.replace("-", "").casefold():
-                    raise LauncherError("WibsVerse returned a credential for a different Minecraft profile.")
-                web_session = WibsVerseWebSession()
+                web_session = WibsVerseWebSession(timeout=8)
                 account_html = web_session.login(self.wibsverse_email, self.wibsverse_password)
                 linked_name = web_session.linked_minecraft_username(account_html)
                 if linked_name and linked_name.casefold() != self.account_name.casefold():
                     raise LauncherError("This WibsVerse account is already linked to a different Minecraft username.")
-                if not linked_name:
+                needs_link = not linked_name
+                if needs_link:
                     if not web_session.can_link_minecraft_profile(account_html):
                         raise LauncherError("Could not determine whether this WibsVerse account already has a Minecraft profile linked.")
-                    link_code = web_session.generate_link_code(self.wibsverse_password)
+                    web_session.confirm_password(self.wibsverse_password)
                 install_launcher_link_bridge(self.root)
                 handoff = SsoHandoff.create(self.root, self.account_uuid, self.account_name, SERVER)
-                if link_code:
-                    handoff.write_link_code(link_code.code, link_code.expires_at)
                 java_properties = {
                     "wibs.sso.ipc": handoff.java_property,
                     "wibs.autojoin": "true",
                 }
-                if link_code:
+                if needs_link:
                     java_properties["wibs.linkaccount.file"] = str(
                         (handoff.directory / "link-code.json").resolve()
                     ).replace("\\", "/")
@@ -555,12 +557,20 @@ class LaunchWorker(QThread):
                 log.close()
                 raise
             log.close()
-            if handoff is not None and credential is not None:
+            if handoff is not None:
                 self.progressed.emit("Completing WibsVerse SSO handoff...")
                 process_id = wait_for_minecraft_process_id(process.pid, game_dir(self.root), launched_at)
                 handoff.write_context(process_id)
-                if not handoff.wait_until_ready(45):
+                if not handoff.wait_until_ready(540):
                     raise LauncherError("WibsVerse SSO did not accept the launch context.")
+                if needs_link and web_session is not None:
+                    self.progressed.emit("Creating a single-use WibsVerse Minecraft link code...")
+                    link_code = web_session.generate_link_code(self.wibsverse_password, confirmed=True)
+                    handoff.write_link_code(link_code.code, link_code.expires_at)
+                self.progressed.emit("Authenticating this offline account with WibsVerse...")
+                credential = WibsVerseGameAuthClient(timeout=8).authenticate(self.account_name, self.wibsverse_password)
+                if credential.runtime_uuid.replace("-", "").casefold() != self.account_uuid.replace("-", "").casefold():
+                    raise LauncherError("WibsVerse returned a credential for a different Minecraft profile.")
                 handoff.write_credential(credential)
                 if not handoff.wait_until_consumed(45):
                     raise LauncherError("Minecraft did not consume the WibsVerse SSO credential.")
@@ -819,6 +829,7 @@ class Launcher(QWidget):
         self._avatar_icon = anonymous_avatar()
         self._avatar_uuid = ""
         self._avatar_workers: list[AvatarWorker] = []
+        self._selected_game = "demon_slayer"
         self._background_pixmap = QPixmap(str(ASSET_DIR / "wibsversebg.png"))
         self.setWindowTitle("Wibsverse Launcher")
         self.setObjectName("launcherWindow")
@@ -987,14 +998,20 @@ class Launcher(QWidget):
         self.play_tab.setText("Demon Slayer")
         self.play_tab.setCheckable(True)
         self.play_tab.setChecked(True)
-        self.play_tab.clicked.connect(lambda: self._show_launcher_page(0))
+        self.play_tab.clicked.connect(lambda: self._select_game("demon_slayer"))
         toolbar.addWidget(self.play_tab)
-        self.console_tab = QToolButton()
-        self.console_tab.setObjectName("navTab")
-        self.console_tab.setText("Console")
-        self.console_tab.setCheckable(True)
-        self.console_tab.clicked.connect(lambda: self._show_launcher_page(1))
-        toolbar.addWidget(self.console_tab)
+        self.jjk_tab = QToolButton()
+        self.jjk_tab.setObjectName("navTab")
+        self.jjk_tab.setText("Jujutsu Kaisen")
+        self.jjk_tab.setCheckable(True)
+        self.jjk_tab.clicked.connect(lambda: self._select_game("jujutsu_kaisen"))
+        toolbar.addWidget(self.jjk_tab)
+        self.solo_leveling_tab = QToolButton()
+        self.solo_leveling_tab.setObjectName("navTab")
+        self.solo_leveling_tab.setText("Solo Leveling")
+        self.solo_leveling_tab.setCheckable(True)
+        self.solo_leveling_tab.clicked.connect(lambda: self._select_game("solo_leveling"))
+        toolbar.addWidget(self.solo_leveling_tab)
         toolbar.addStretch()
         self.account_button = QToolButton()
         self.account_button.setObjectName("account")
@@ -1014,6 +1031,8 @@ class Launcher(QWidget):
         self.settings_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.settings_menu = QMenu(self)
         for label, callback in (
+            ("Console", lambda: self._show_launcher_page(1)),
+            ("Client Mods", lambda: self._show_launcher_page(2)),
             ("Check for Updates", self.check_updates),
             ("Check for Launcher Updates", self.check_launcher_updates),
             ("Set HeadlessMc Path...", self.select_hmc),
@@ -1043,14 +1062,14 @@ class Launcher(QWidget):
         category.setObjectName("category")
         intro.addWidget(category)
         intro.addSpacing(12)
-        header = QLabel("Wib’s Demon Slayer")
-        header.setObjectName("heroTitle")
-        intro.addWidget(header)
-        description = QLabel("Walk the Slayer path or embrace the Demon path. Master techniques, conquer dungeons and rise through the ranks.")
-        description.setObjectName("description")
-        description.setFixedWidth(425)
-        description.setWordWrap(True)
-        intro.addWidget(description)
+        self.game_header = QLabel("Wib’s Demon Slayer")
+        self.game_header.setObjectName("heroTitle")
+        intro.addWidget(self.game_header)
+        self.game_description = QLabel("Walk the Slayer path or embrace the Demon path. Master techniques, conquer dungeons and rise through the ranks.")
+        self.game_description.setObjectName("description")
+        self.game_description.setFixedWidth(425)
+        self.game_description.setWordWrap(True)
+        intro.addWidget(self.game_description)
         intro.addSpacing(18)
         guide = QToolButton()
         guide.setObjectName("textLink")
@@ -1142,6 +1161,9 @@ class Launcher(QWidget):
         console_layout.setContentsMargins(34, 24, 34, 24)
         console_layout.setSpacing(12)
         console_header = QHBoxLayout()
+        console_back_button = QPushButton("←  Back to Launcher")
+        console_back_button.clicked.connect(lambda: self._show_launcher_page(0))
+        console_header.addWidget(console_back_button)
         console_heading = QLabel("GAME CONSOLE")
         console_heading.setObjectName("category")
         console_header.addWidget(console_heading)
@@ -1153,7 +1175,7 @@ class Launcher(QWidget):
         self.console_copy_button.clicked.connect(self._copy_console)
         console_header.addWidget(self.console_copy_button)
         console_layout.addLayout(console_header)
-        self.console_log_label = QLabel(str(game_dir(self.root) / "logs" / "latest.log"))
+        self.console_log_label = QLabel(str(game_dir(self._game_root()) / "logs" / "latest.log"))
         self.console_log_label.setObjectName("muted")
         self.console_log_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         console_layout.addWidget(self.console_log_label)
@@ -1167,6 +1189,34 @@ class Launcher(QWidget):
         self.console_status.setObjectName("muted")
         console_layout.addWidget(self.console_status)
         self.page_stack.addWidget(console_page)
+
+        client_mods_page = QWidget()
+        client_mods_layout = QVBoxLayout(client_mods_page)
+        client_mods_layout.setContentsMargins(48, 36, 48, 36)
+        client_mods_layout.setSpacing(14)
+        mods_header = QHBoxLayout()
+        mods_back_button = QPushButton("←  Back to Launcher")
+        mods_back_button.clicked.connect(lambda: self._show_launcher_page(0))
+        mods_header.addWidget(mods_back_button)
+        mods_header.addStretch()
+        client_mods_layout.insertLayout(0, mods_header)
+        mods_heading = QLabel("CLIENT MODS")
+        mods_heading.setObjectName("category")
+        client_mods_layout.addWidget(mods_heading)
+        mods_title = QLabel("Customize your client")
+        mods_title.setObjectName("heroTitle")
+        client_mods_layout.addWidget(mods_title)
+        mods_description = QLabel("Manage client-side Minecraft mods in your Wibsverse game folder.")
+        mods_description.setObjectName("description")
+        client_mods_layout.addWidget(mods_description)
+        client_mods_layout.addSpacing(12)
+        open_mods_folder = QPushButton("Open Client Mods Folder")
+        open_mods_folder.setObjectName("primary")
+        open_mods_folder.setFixedWidth(230)
+        open_mods_folder.clicked.connect(self.open_mods_folder)
+        client_mods_layout.addWidget(open_mods_folder)
+        client_mods_layout.addStretch()
+        self.page_stack.addWidget(client_mods_page)
         outer.addWidget(self.page_stack, 1)
 
         footer_frame = QFrame()
@@ -1200,13 +1250,82 @@ class Launcher(QWidget):
 
     def _show_launcher_page(self, index: int):
         self.page_stack.setCurrentIndex(index)
-        self.play_tab.setChecked(index == 0)
-        self.console_tab.setChecked(index == 1)
+        for game, tab in self._game_tabs():
+            tab.setChecked(game == self._selected_game)
         if index == 1:
+            self._update_console_context()
             self.console_timer.start()
             self._poll_console_log()
         else:
             self.console_timer.stop()
+
+    def _game_tabs(self):
+        return (
+            ("demon_slayer", self.play_tab),
+            ("jujutsu_kaisen", self.jjk_tab),
+            ("solo_leveling", self.solo_leveling_tab),
+        )
+
+    def _game_root(self, game: str | None = None) -> Path:
+        game = game or self._selected_game
+        if game == "demon_slayer":
+            return self.root
+        return self.root / "games" / game
+
+    def _update_console_context(self):
+        path = game_dir(self._game_root()) / "logs" / "latest.log"
+        self.console_log_label.setText(str(path))
+        self._console_file_identity = None
+        self._console_offset = 0
+        self._console_initialized = False
+        self.console_output.clear()
+        self.console_status.setText(f"Waiting for {self._selected_game.replace('_', ' ')} log output…")
+
+    def _select_game(self, game: str):
+        self._selected_game = game
+        games = {
+            "demon_slayer": {
+                "title": "Wib’s Demon Slayer",
+                "description": "Walk the Slayer path or embrace the Demon path. Master techniques, conquer dungeons and rise through the ranks.",
+                "background": "wibsversebg.png",
+                "button": " PLAY",
+                "available": True,
+            },
+            "jujutsu_kaisen": {
+                "title": "Jujutsu Kaisen",
+                "description": "Enter a cursed world of techniques, clans, bosses and competitive progression.",
+                "background": "wibsversebg_jjk.png",
+                "button": "Coming Soon",
+                "available": False,
+            },
+            "solo_leveling": {
+                "title": "Solo Leveling",
+                "description": "Awaken your power, clear dungeons and climb through a progression-driven RPG world.",
+                "background": "wibsversebg_sl.png",
+                "button": "Coming Soon",
+                "available": False,
+            },
+        }[game]
+        self.game_header.setText(games["title"])
+        self.game_description.setText(games["description"])
+        self._background_pixmap = QPixmap(str(ASSET_DIR / games["background"]))
+        self.play_button.setText(games["button"])
+        self.play_button.setIcon(QIcon(str(ASSET_DIR / "play.svg")) if games["available"] else QIcon())
+        self.play_button.setEnabled(games["available"])
+        self.status.setText("Checking for updates..." if games["available"] else "Modpack coming soon")
+        self._update_account_cta()
+        self._set_busy(self.task is not None)
+        for tab_game, tab in self._game_tabs():
+            tab.setChecked(tab_game == game)
+        self.page_stack.setCurrentIndex(0)
+        if hasattr(self, "console_log_label"):
+            self._update_console_context()
+        self.update()
+
+    def open_mods_folder(self):
+        folder = game_dir(self._game_root()) / "mods"
+        folder.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
 
     def _clear_console(self):
         self.console_output.clear()
@@ -1217,7 +1336,7 @@ class Launcher(QWidget):
     def _prepare_console_for_launch(self):
         """Start a fresh visible console without modifying Minecraft's log file."""
         self.console_output.clear()
-        path = game_dir(self.root) / "logs" / "latest.log"
+        path = game_dir(self._game_root()) / "logs" / "latest.log"
         try:
             info = path.stat()
         except OSError:
@@ -1244,10 +1363,10 @@ class Launcher(QWidget):
     def _poll_console_log(self):
         if self.page_stack.currentIndex() != 1:
             return
-        path = game_dir(self.root) / "logs" / "latest.log"
+        path = game_dir(self._game_root()) / "logs" / "latest.log"
         self.console_log_label.setText(str(path))
-        running = self.game_process is not None and self.game_process.poll() is None
-        self.console_tab.setText("Console • Running" if running else "Console")
+        running = self._selected_game == "demon_slayer" \
+            and self.game_process is not None and self.game_process.poll() is None
         try:
             info = path.stat()
         except OSError:
@@ -1405,8 +1524,12 @@ class Launcher(QWidget):
         self._persist()
 
     def _update_account_cta(self):
-        self.play_button.setVisible(self._has_accounts)
-        self.add_account_button.setVisible(not self._has_accounts)
+        if self._selected_game == "demon_slayer":
+            self.play_button.setVisible(self._has_accounts)
+            self.add_account_button.setVisible(not self._has_accounts)
+        else:
+            self.play_button.setVisible(True)
+            self.add_account_button.setVisible(False)
 
     def _rebuild_account_menu(self, available: list[dict]):
         menu = self.account_menu
@@ -1621,7 +1744,9 @@ class Launcher(QWidget):
         installed = bool(read_installed(self.root).get("version"))
         active = busy or self.login_task is not None or self.offline_task is not None \
             or self.remove_account_task is not None or self.wibsverse_task is not None or self.launch_task is not None
-        self.play_button.setEnabled(not active and installed and self._has_accounts)
+        self.play_button.setEnabled(
+            self._selected_game == "demon_slayer" and not active and installed and self._has_accounts
+        )
         self.add_account_button.setEnabled(not active)
         self.settings_button.setEnabled(not active)
 
@@ -1798,7 +1923,7 @@ class Launcher(QWidget):
         return True
 
     def open_folder(self):
-        folder = game_dir(self.root)
+        folder = game_dir(self._game_root())
         folder.mkdir(parents=True, exist_ok=True)
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
 
@@ -1862,7 +1987,6 @@ class Launcher(QWidget):
             return
         self.game_process = game_process
         self._prepare_console_for_launch()
-        self.console_tab.setText("Console • Running")
         if result.get("minecraft_linked"):
             key = str(result.get("account_key") or account_credential_key(self.selection))
             profile = dict(self._account_profiles().get(key) or {})
@@ -1976,7 +2100,7 @@ class Launcher(QWidget):
         if not password:
             QMessageBox.warning(self, "WibsVerse account", "Enter a WibsVerse password to link this account.")
             return
-        self.wibsverse_task = WibsVerseCredentialWorker(key, email, password)
+        self.wibsverse_task = WibsVerseCredentialWorker(key, account["name"], email, password)
         self.wibsverse_task.succeeded.connect(
             lambda saved_email, a=account: self._wibsverse_credentials_saved(a, saved_email)
         )

@@ -185,6 +185,7 @@ class LauncherCoreTests(unittest.TestCase):
             self.assertFalse(core.hmc_profile_is_pinned(root))
 
     def test_create_hmc_offline_account_writes_tokenless_record(self):
+        self.assertEqual(core.offline_player_uuid("Notch"), "b50ad385-829d-3141-a216-7e7d7539ba7f")
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             account = core.create_hmc_offline_account(root, "LocalPlayer")

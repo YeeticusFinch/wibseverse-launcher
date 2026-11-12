@@ -1,10 +1,15 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-gradle -p launcher-link-bridge build
+call gradle -p launcher-link-bridge build
 if errorlevel 1 exit /b 1
 if not exist ".build-venv\Scripts\python.exe" (
-    py -m venv ".build-venv"
+    where py >nul 2>nul
+    if errorlevel 1 (
+        python -m venv ".build-venv"
+    ) else (
+        py -m venv ".build-venv"
+    )
     if errorlevel 1 exit /b 1
 )
 ".build-venv\Scripts\python.exe" -m pip install -r requirements.txt pyinstaller pillow

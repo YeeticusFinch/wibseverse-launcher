@@ -89,7 +89,7 @@ class _PrimaryMinecraftProfileParser(HTMLParser):
             if self.heading.strip().casefold() == "minecraft profile":
                 if tag == "th":
                     self._row_label = value.casefold()
-                elif self._row_label in {"username", "minecraft username", "profile name"}:
+                elif self._row_label in {"username", "minecraft username", "profile name", "player name"}:
                     self.username = value
             self._cell = None
 
@@ -198,7 +198,7 @@ class WibsVerseWebSession:
         if not form or not token:
             raise WibsVerseAuthError("Could not read the current WibsVerse login form.")
         values = dict(form["inputs"])
-        values.update({"_token": token, "login": email.strip(), "password": password, "remember": "1"})
+        values.update({"_token": token, "login": email.strip(), "password": password})
         url = urllib.parse.urljoin(SITE_ORIGIN + "/", form["action"])
         final_url, result = self._request(url, urllib.parse.urlencode(values).encode("utf-8"))
         if urllib.parse.urlparse(final_url).path.rstrip("/") == "/email/verify":
@@ -214,8 +214,8 @@ class WibsVerseWebSession:
             raise WibsVerseAuthError("WibsVerse sign-in did not complete. Check your credentials and account status.")
         return account_html
 
-    def generate_link_code(self, password: str) -> LinkCode:
-        # Re-authenticate the protected action using a fresh, session-specific CSRF token.
+    def confirm_password(self, password: str):
+        """Satisfy the site's recent-password-confirmation gate in this memory-only session."""
         confirm_url, confirm_html = self._request(SITE_ORIGIN + "/user/confirm-password")
         page = self._parse(confirm_html)
         form = next((form for form in page.forms if "/user/confirm-password" in form["action"]), None)
@@ -229,6 +229,11 @@ class WibsVerseWebSession:
             )
         elif urllib.parse.urlparse(confirm_url).path.rstrip("/") != "/account":
             raise WibsVerseAuthError("Could not read WibsVerse's password-confirmation form.")
+
+    def generate_link_code(self, password: str, *, confirmed: bool = False) -> LinkCode:
+        # Re-authenticate the protected action using a fresh, session-specific CSRF token.
+        if not confirmed:
+            self.confirm_password(password)
 
         _url, account_html = self._request(SITE_ORIGIN + "/account")
         account = self._parse(account_html)

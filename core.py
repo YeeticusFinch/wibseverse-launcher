@@ -954,6 +954,12 @@ def hmc_offline_accounts_path(root: Path) -> Path:
     return hmc_data_dir(root) / ".auth" / "offline" / ".accounts.json"
 
 
+def offline_player_uuid(name: str) -> str:
+    """Minecraft's canonical UUID for an unauthenticated OfflinePlayer profile."""
+    raw = hashlib.md5(("OfflinePlayer:" + name).encode("utf-8"), usedforsecurity=False).digest()
+    return str(uuid.UUID(bytes=raw, version=3))
+
+
 def account_credential_key(account: dict[str, str]) -> str:
     """Return a stable, non-secret OS-keychain key for a Minecraft account."""
     mode = account.get("mode")
@@ -968,7 +974,7 @@ def create_hmc_offline_account(root: Path, name: str, uuid_text: str | None = No
     name = name.strip()
     if not name or any(char in name for char in "\r\n\x00"):
         raise LauncherError("Enter a valid offline account name")
-    uuid_text = uuid_text or str(uuid.uuid4())
+    uuid_text = uuid_text or offline_player_uuid(name)
     try:
         uuid_text = str(uuid.UUID(uuid_text))
     except (ValueError, AttributeError) as error:
