@@ -19,7 +19,8 @@ from PySide6.QtWidgets import (
     QApplication, QDialog, QFileDialog, QFrame, QHBoxLayout,
     QLabel, QLineEdit, QMenu, QMessageBox, QProgressBar, QPushButton, QFormLayout,
     QToolButton, QVBoxLayout, QWidget, QCheckBox, QPlainTextEdit, QStackedWidget,
-    QInputDialog, QDialogButtonBox,
+    QInputDialog, QDialogButtonBox, QTableWidget, QTableWidgetItem, QHeaderView,
+    QListWidget, QListWidgetItem, QComboBox,
 )
 
 from core import (
@@ -39,6 +40,11 @@ from wibsverse_auth import (
     WibsVerseWebSession, delete_password, load_password, save_password,
 )
 from sso_handoff import SsoHandoff, SsoHandoffError
+from client_mods import (
+    ClientMod, delete_mod, get_project, get_project_dependencies, get_project_versions,
+    install_modrinth_version, list_custom_mods, lookup_modrinth_hash, mod_sha1, search_modrinth,
+    remember_modrinth_version, set_mod_enabled,
+)
 
 PINK = "#D9439F"
 INK = "#100B12"
@@ -269,6 +275,252 @@ class LauncherReleaseWorker(QThread):
     def run(self):
         try:
             self.succeeded.emit(fetch_latest_launcher_release())
+        except Exception as error:
+            self.failed.emit(f"{type(error).__name__}: {error}")
+
+
+class ModrinthWorker(QThread):
+    succeeded = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, operation: str, *args):
+        super().__init__()
+        self.operation = operation
+        self.args = args
+
+    def run(self):
+        try:
+            if self.operation == "search":
+                result = search_modrinth(self.args[0])
+            elif self.operation == "versions":
+                project = get_project(self.args[0])
+                result = {"project": project, "versions": get_project_versions(self.args[0])}
+            elif self.operation == "dependencies":
+                result = get_project_dependencies(self.args[0])
+            elif self.operation == "install":
+                root, project, version, dependencies = self.args[:4]
+                replace = self.args[4] if len(self.args) > 4 else None
+                installed = []
+                for dependency in dependencies:
+                    dep_project, dep_version = dependency["project"], dependency["version"]
+                    dependency_files = [item for item in dep_version.get("files", []) if isinstance(item, dict)
+                                        and str(item.get("filename", "")).lower().endswith(".jar")]
+                    primary_file = next((item for item in dependency_files if item.get("primary")),
+                                        dependency_files[0] if dependency_files else {})
+                    filename = str(primary_file.get("filename") or "")
+                    if filename and (
+                        (game_dir(root) / "mods" / filename).exists()
+                        or (game_dir(root) / "mods" / (filename + ".disabled")).exists()
+                    ):
+                        continue
+                    installed.append(install_modrinth_version(root, dep_project, dep_version))
+                installed.append(install_modrinth_version(root, project, version, replace))
+                result = installed
+            elif self.operation == "update":
+                root, mod = self.args
+                record = None
+                sha1 = mod.sha1 or mod_sha1(mod.path)
+                if mod.project_id:
+                    project_id = mod.project_id
+                else:
+                    record = lookup_modrinth_hash(sha1)
+                    project_id = str((record or {}).get("project_id") or "")
+                if not project_id:
+                    result = {"mod": mod, "project": None, "version": None}
+                else:
+                    project = get_project(project_id)
+                    versions = get_project_versions(project_id)
+                    if record:
+                        remember_modrinth_version(root, mod.filename, record, sha1)
+                    latest = versions[0] if versions else None
+                    current_id = mod.version_id or str((record or {}).get("id") or "")
+                    result = {
+                        "root": root, "mod": mod, "project": project, "version": latest,
+                        "has_update": bool(latest and current_id and latest.get("id") != current_id),
+                        "untracked": not bool(mod.version_id),
+                    }
+            elif self.operation == "lookup":
+                root, mod = self.args
+                sha1 = mod.sha1 or mod_sha1(mod.path)
+                record = lookup_modrinth_hash(sha1)
+                if not record:
+                    result = {"mod": mod, "project": None, "version": None}
+                else:
+                    project = get_project(str(record.get("project_id") or ""))
+                    remember_modrinth_version(root, mod.filename, record, sha1)
+                    result = {"mod": mod, "project": project, "version": record}
+            else:
+                raise LauncherError("Unknown Modrinth operation")
+            self.succeeded.emit(result)
+        except Exception as error:
+            self.failed.emit(f"{type(error).__name__}: {error}")
+
+
+class AddModDialog(QDialog):
+    requested_install = Signal(object, object)
+
+    def __init__(self, parent: QWidget):
+        super().__init__(parent)
+        self.setWindowTitle("Add a Mod from Modrinth")
+        self.setMinimumSize(620, 520)
+        self.setWindowFlag(Qt.WindowType.WindowContextHelpButtonHint, False)
+        self.project: dict | None = None
+        self.versions: list[dict] = []
+        self.worker: ModrinthWorker | None = None
+        self.pending_worker_request: tuple[str, tuple] | None = None
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(26, 24, 26, 24)
+        layout.setSpacing(12)
+        title = QLabel("Find a Forge mod")
+        title.setObjectName("updateTitle")
+        layout.addWidget(title)
+        hint = QLabel("Showing mods compatible with Minecraft 1.20.1 and Forge.")
+        hint.setObjectName("muted")
+        layout.addWidget(hint)
+        search_row = QHBoxLayout()
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Search Modrinth")
+        self.search.returnPressed.connect(self.search_projects)
+        search_row.addWidget(self.search, 1)
+        self.search_button = QPushButton("Search")
+        self.search_button.clicked.connect(self.search_projects)
+        search_row.addWidget(self.search_button)
+        layout.addLayout(search_row)
+        self.results = QListWidget()
+        self.results.currentRowChanged.connect(self.select_project)
+        layout.addWidget(self.results, 1)
+        version_row = QHBoxLayout()
+        version_row.addWidget(QLabel("Version"))
+        self.version = QComboBox()
+        version_row.addWidget(self.version, 1)
+        layout.addLayout(version_row)
+        self.status = QLabel("Search for a mod to begin.")
+        self.status.setObjectName("status")
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        self.install_button = QPushButton("Add Mod")
+        self.install_button.setObjectName("primary")
+        self.install_button.setEnabled(False)
+        self.install_button.clicked.connect(self.request_selected_install)
+        buttons.addWidget(self.install_button)
+        cancel = QPushButton("Close")
+        cancel.clicked.connect(self.reject)
+        buttons.addWidget(cancel)
+        layout.addLayout(buttons)
+
+    def _run(self, operation: str, *args):
+        if self.worker and self.worker.isRunning():
+            self.pending_worker_request = (operation, args)
+            return
+        self.worker = ModrinthWorker(operation, *args)
+        self.worker.succeeded.connect(self._worker_succeeded)
+        self.worker.failed.connect(self._worker_failed)
+        self.worker.finished.connect(self._start_pending_worker)
+        self.worker.start()
+
+    def _start_pending_worker(self):
+        if self.pending_worker_request:
+            operation, args = self.pending_worker_request
+            self.pending_worker_request = None
+            self._run(operation, *args)
+
+    def search_projects(self):
+        query = self.search.text().strip()
+        if not query:
+            self.status.setText("Enter a search term.")
+            return
+        self.search_button.setEnabled(False)
+        self.status.setText("Searching Modrinth…")
+        self._run("search", query)
+
+    def select_project(self, index: int):
+        if index < 0 or index >= self.results.count():
+            return
+        project = self.results.item(index).data(Qt.ItemDataRole.UserRole)
+        self.project = project
+        self.install_button.setEnabled(False)
+        self.status.setText("Loading compatible versions…")
+        self._run("versions", project["project_id"])
+
+    def _worker_succeeded(self, result: object):
+        self.search_button.setEnabled(True)
+        if isinstance(result, list):
+            self.results.clear()
+            for project in result:
+                item = QListWidgetItem(f"{project.get('title', 'Untitled')}  ·  {project.get('author', 'Unknown author')}\n{project.get('description', '')}")
+                item.setData(Qt.ItemDataRole.UserRole, project)
+                self.results.addItem(item)
+            self.status.setText(f"Found {len(result)} compatible mod(s).")
+        elif isinstance(result, dict) and "versions" in result:
+            self.project = result.get("project") or self.project
+            self.versions = result.get("versions", [])
+            self.version.clear()
+            for version in self.versions:
+                self.version.addItem(
+                    f"{version.get('version_number', 'Unknown')}  ·  {version.get('version_type', 'release')}",
+                    version,
+                )
+            self.install_button.setEnabled(bool(self.versions))
+            self.status.setText("Choose a version to add." if self.versions else "No compatible Forge versions were found.")
+
+    def _worker_failed(self, message: str):
+        self.search_button.setEnabled(True)
+        self.status.setText(message)
+
+    def request_selected_install(self):
+        version = self.version.currentData()
+        if self.project and isinstance(version, dict):
+            self.install_button.setEnabled(False)
+            self.status.setText("Checking required dependencies…")
+            self.requested_install.emit(self.project, version)
+
+    def reject(self):
+        if self.worker and self.worker.isRunning():
+            self.status.setText("Please wait for the Modrinth request to finish before closing.")
+            return
+        super().reject()
+
+    def closeEvent(self, event):
+        if self.worker and self.worker.isRunning():
+            event.ignore()
+            self.status.setText("Please wait for the Modrinth request to finish before closing.")
+            return
+        super().closeEvent(event)
+
+
+class DependencyPlanWorker(QThread):
+    succeeded = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, project: dict, version: dict):
+        super().__init__()
+        self.project = project
+        self.version = version
+
+    def run(self):
+        try:
+            dependencies = []
+            for dependency in self.version.get("dependencies", []):
+                if not isinstance(dependency, dict) or dependency.get("dependency_type") != "required":
+                    continue
+                project_id = dependency.get("project_id")
+                if project_id == self.project.get("id"):
+                    continue
+                if not project_id:
+                    label = dependency.get("file_name") or "an external required dependency"
+                    raise LauncherError(f"Modrinth lists {label}, which cannot be resolved as a Modrinth project.")
+                versions = get_project_versions(str(project_id))
+                pinned_id = dependency.get("version_id")
+                chosen = next((item for item in versions if item.get("id") == pinned_id), None)
+                if chosen is None and not pinned_id and versions:
+                    chosen = versions[0]
+                if not chosen:
+                    raise LauncherError(f"A required dependency ({project_id}) has no compatible Forge 1.20.1 version.")
+                project = get_project(str(project_id))
+                dependencies.append({"project": project, "version": chosen})
+            self.succeeded.emit(dependencies)
         except Exception as error:
             self.failed.emit(f"{type(error).__name__}: {error}")
 
@@ -830,6 +1082,12 @@ class Launcher(QWidget):
         self._avatar_uuid = ""
         self._avatar_workers: list[AvatarWorker] = []
         self._selected_game = "demon_slayer"
+        self.client_mods: list[ClientMod] = []
+        self.client_mod_worker: ModrinthWorker | None = None
+        self.pending_client_mod_request: tuple[str, tuple] | None = None
+        self.dependency_plan_worker: DependencyPlanWorker | None = None
+        self.pending_mod_install: tuple[dict, dict] | None = None
+        self.add_mod_dialog: AddModDialog | None = None
         self._background_pixmap = QPixmap(str(ASSET_DIR / "wibsversebg.png"))
         self.setWindowTitle("Wibsverse Launcher")
         self.setObjectName("launcherWindow")
@@ -948,6 +1206,10 @@ class Launcher(QWidget):
           QProgressBar::chunk { background:#D9439F; border-radius:6px; }
           QDialog { background:#1A1B27; }
           QLineEdit { background:#2A2936; border:1px solid #54495B; border-radius:8px; padding:12px; }
+          QTableWidget { background:#100E14; alternate-background-color:#19141D; gridline-color:#392733;
+              border:1px solid #392733; border-radius:8px; selection-background-color:#6E315A; }
+          QHeaderView::section { background:#211420; color:#BAA6B4; border:0; border-bottom:1px solid #392733;
+              padding:8px; font-weight:600; }
           QPlainTextEdit#consoleOutput { background:#100E14; color:#E6DDE5; border:1px solid #392733;
               border-radius:8px; padding:8px; font:9pt "Consolas"; selection-background-color:#8D3267; }
         ''')
@@ -1209,13 +1471,50 @@ class Launcher(QWidget):
         mods_description = QLabel("Manage client-side Minecraft mods in your Wibsverse game folder.")
         mods_description.setObjectName("description")
         client_mods_layout.addWidget(mods_description)
-        client_mods_layout.addSpacing(12)
-        open_mods_folder = QPushButton("Open Client Mods Folder")
-        open_mods_folder.setObjectName("primary")
-        open_mods_folder.setFixedWidth(230)
-        open_mods_folder.clicked.connect(self.open_mods_folder)
-        client_mods_layout.addWidget(open_mods_folder)
-        client_mods_layout.addStretch()
+        mods_controls = QHBoxLayout()
+        self.mods_search = QLineEdit()
+        self.mods_search.setPlaceholderText("Search mods…")
+        self.mods_search.textChanged.connect(self._filter_mod_table)
+        mods_controls.addWidget(self.mods_search, 1)
+        self.add_mod_button = QPushButton("+  Add Mod")
+        self.add_mod_button.setObjectName("primary")
+        self.add_mod_button.clicked.connect(self.show_add_mod_dialog)
+        mods_controls.addWidget(self.add_mod_button)
+        self.refresh_mods_button = QPushButton("Refresh")
+        self.refresh_mods_button.clicked.connect(self._refresh_client_mods)
+        mods_controls.addWidget(self.refresh_mods_button)
+        client_mods_layout.addLayout(mods_controls)
+        self.mods_table = QTableWidget(0, 3)
+        self.mods_table.setHorizontalHeaderLabels(["Mod", "Version", "Enabled"])
+        self.mods_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.mods_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.mods_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.mods_table.verticalHeader().setVisible(False)
+        self.mods_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.mods_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.mods_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.mods_table.itemChanged.connect(self._client_mod_item_changed)
+        self.mods_table.itemSelectionChanged.connect(self._update_mod_actions)
+        client_mods_layout.addWidget(self.mods_table, 1)
+        action_row = QHBoxLayout()
+        action_row.addWidget(QLabel("Select a mod for more actions."))
+        action_row.addStretch()
+        self.check_mod_updates_button = QPushButton("Check for Updates")
+        self.check_mod_updates_button.clicked.connect(self.check_selected_mod_updates)
+        action_row.addWidget(self.check_mod_updates_button)
+        self.check_mod_dependencies_button = QPushButton("Check Dependencies")
+        self.check_mod_dependencies_button.clicked.connect(self.check_selected_mod_dependencies)
+        action_row.addWidget(self.check_mod_dependencies_button)
+        self.delete_mod_button = QPushButton("Delete Mod")
+        self.delete_mod_button.clicked.connect(self.delete_selected_mod)
+        action_row.addWidget(self.delete_mod_button)
+        self.check_mod_updates_button.setEnabled(False)
+        self.check_mod_dependencies_button.setEnabled(False)
+        self.delete_mod_button.setEnabled(False)
+        client_mods_layout.addLayout(action_row)
+        self.mods_status = QLabel("Extra client mods are detected from the mods folder.")
+        self.mods_status.setObjectName("status")
+        client_mods_layout.addWidget(self.mods_status)
         self.page_stack.addWidget(client_mods_page)
         outer.addWidget(self.page_stack, 1)
 
@@ -1258,6 +1557,8 @@ class Launcher(QWidget):
             self._poll_console_log()
         else:
             self.console_timer.stop()
+        if index == 2:
+            self._refresh_client_mods()
 
     def _game_tabs(self):
         return (
@@ -1326,6 +1627,230 @@ class Launcher(QWidget):
         folder = game_dir(self._game_root()) / "mods"
         folder.mkdir(parents=True, exist_ok=True)
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+
+    def _refresh_client_mods(self):
+        try:
+            self.client_mods = list_custom_mods(self._game_root(), read_installed(self._game_root()))
+        except OSError as error:
+            self.mods_status.setText(f"Could not read the mods folder: {error}")
+            return
+        self.mods_table.blockSignals(True)
+        self.mods_table.setRowCount(0)
+        for mod in self.client_mods:
+            row = self.mods_table.rowCount()
+            self.mods_table.insertRow(row)
+            name = QTableWidgetItem(mod.filename)
+            name.setData(Qt.ItemDataRole.UserRole, mod)
+            self.mods_table.setItem(row, 0, name)
+            version = mod.version_number or ("Modrinth" if mod.project_id else "Manual")
+            self.mods_table.setItem(row, 1, QTableWidgetItem(version))
+            enabled = QTableWidgetItem()
+            enabled.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsUserCheckable)
+            enabled.setCheckState(Qt.CheckState.Checked if mod.enabled else Qt.CheckState.Unchecked)
+            self.mods_table.setItem(row, 2, enabled)
+        self.mods_table.blockSignals(False)
+        self._filter_mod_table(self.mods_search.text())
+        self._update_mod_actions()
+        self.mods_status.setText(f"{len(self.client_mods)} extra mod(s) found. Modpack mods are hidden from this list.")
+
+    def _filter_mod_table(self, query: str):
+        words = [word.casefold() for word in query.split()]
+        for row in range(self.mods_table.rowCount()):
+            name = self.mods_table.item(row, 0).text().casefold()
+            version = self.mods_table.item(row, 1).text().casefold()
+            haystack = name + " " + version
+            self.mods_table.setRowHidden(row, not all(word in haystack for word in words))
+
+    def _selected_client_mod(self) -> ClientMod | None:
+        row = self.mods_table.currentRow()
+        if row < 0:
+            return None
+        item = self.mods_table.item(row, 0)
+        return item.data(Qt.ItemDataRole.UserRole) if item else None
+
+    def _update_mod_actions(self):
+        selected = self._selected_client_mod() is not None
+        self.delete_mod_button.setEnabled(selected)
+        self.check_mod_updates_button.setEnabled(selected)
+        self.check_mod_dependencies_button.setEnabled(selected)
+
+    def _client_mod_item_changed(self, item: QTableWidgetItem):
+        if item.column() != 2:
+            return
+        row = item.row()
+        name_item = self.mods_table.item(row, 0)
+        mod = name_item.data(Qt.ItemDataRole.UserRole) if name_item else None
+        if not isinstance(mod, ClientMod):
+            return
+        if self.game_process is not None and self.game_process.poll() is None:
+            self.mods_table.blockSignals(True)
+            item.setCheckState(Qt.CheckState.Checked if mod.enabled else Qt.CheckState.Unchecked)
+            self.mods_table.blockSignals(False)
+            QMessageBox.information(self, "Minecraft is running", "Close Minecraft before changing client mods.")
+            return
+        try:
+            set_mod_enabled(self._game_root(), mod, item.checkState() == Qt.CheckState.Checked)
+            self._refresh_client_mods()
+            self.mods_status.setText(f"{mod.filename} {'enabled' if item.checkState() == Qt.CheckState.Checked else 'disabled'}.")
+        except (OSError, LauncherError) as error:
+            QMessageBox.warning(self, "Could not change mod", str(error))
+            self._refresh_client_mods()
+
+    def delete_selected_mod(self):
+        mod = self._selected_client_mod()
+        if mod is None:
+            return
+        if self.game_process is not None and self.game_process.poll() is None:
+            QMessageBox.information(self, "Minecraft is running", "Close Minecraft before deleting mods.")
+            return
+        answer = QMessageBox.question(
+            self, "Delete Mod", f"Permanently delete {mod.filename}?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            delete_mod(self._game_root(), mod)
+            self._refresh_client_mods()
+            self.mods_status.setText(f"Deleted {mod.filename}.")
+        except OSError as error:
+            QMessageBox.warning(self, "Could not delete mod", str(error))
+
+    def show_add_mod_dialog(self):
+        if self.game_process is not None and self.game_process.poll() is None:
+            QMessageBox.information(self, "Minecraft is running", "Close Minecraft before adding mods.")
+            return
+        self.add_mod_dialog = AddModDialog(self)
+        self.add_mod_dialog.requested_install.connect(self._prepare_mod_install)
+        self.add_mod_dialog.exec()
+        self.add_mod_dialog = None
+        self.pending_mod_install = None
+
+    def _prepare_mod_install(self, project: dict, version: dict):
+        if self.dependency_plan_worker and self.dependency_plan_worker.isRunning():
+            return
+        self.pending_mod_install = (project, version)
+        self.dependency_plan_worker = DependencyPlanWorker(project, version)
+        self.dependency_plan_worker.succeeded.connect(self._mod_dependency_plan_ready)
+        self.dependency_plan_worker.failed.connect(self._mod_dependency_plan_failed)
+        self.dependency_plan_worker.start()
+
+    def _mod_dependency_plan_ready(self, dependencies: object):
+        if not isinstance(dependencies, list) or self.pending_mod_install is None or self.add_mod_dialog is None:
+            return
+        project, version = self.pending_mod_install
+        dependency_names = [str(item["project"].get("title") or item["project"].get("slug") or "Required dependency") for item in dependencies]
+        if dependency_names:
+            answer = QMessageBox.question(
+                self, "Required Dependencies",
+                f"{project.get('title', 'This mod')} requires:\n\n" + "\n".join(f"• {name}" for name in dependency_names)
+                + "\n\nInstall these compatible dependencies too?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                if self.add_mod_dialog:
+                    self.add_mod_dialog.install_button.setEnabled(True)
+                    self.add_mod_dialog.status.setText("Add cancelled. You can choose another version or try again.")
+                self.pending_mod_install = None
+                return
+        if self.add_mod_dialog:
+            self.add_mod_dialog.status.setText("Downloading mod and required dependencies…")
+        self._start_client_mod_worker("install", self._game_root(), project, version, dependencies)
+
+    def _mod_dependency_plan_failed(self, message: str):
+        if self.add_mod_dialog:
+            self.add_mod_dialog.install_button.setEnabled(True)
+            self.add_mod_dialog.status.setText("Could not check dependencies: " + message)
+
+    def _start_client_mod_worker(self, operation: str, *args):
+        if operation == "install" and self.game_process is not None and self.game_process.poll() is None:
+            message = "Close Minecraft before installing or updating mods."
+            if self.add_mod_dialog:
+                self.add_mod_dialog.install_button.setEnabled(True)
+                self.add_mod_dialog.status.setText(message)
+            else:
+                QMessageBox.information(self, "Minecraft is running", message)
+            return
+        if self.client_mod_worker and self.client_mod_worker.isRunning():
+            self.pending_client_mod_request = (operation, args)
+            return
+        self.mods_status.setText("Contacting Modrinth…")
+        self.client_mod_worker = ModrinthWorker(operation, *args)
+        self.client_mod_worker.succeeded.connect(lambda result, op=operation: self._client_mod_worker_succeeded(op, result))
+        self.client_mod_worker.failed.connect(lambda message, op=operation: self._client_mod_worker_failed(op, message))
+        self.client_mod_worker.finished.connect(self._client_mod_worker_finished)
+        self.client_mod_worker.start()
+
+    def _client_mod_worker_failed(self, operation: str, message: str):
+        if operation == "install" and self.add_mod_dialog:
+            self.add_mod_dialog.install_button.setEnabled(True)
+            self.add_mod_dialog.status.setText("Could not install mod: " + message)
+        else:
+            QMessageBox.warning(self, "Modrinth Request Failed", message)
+
+    def _client_mod_worker_finished(self):
+        self.client_mod_worker = None
+        if self.pending_client_mod_request:
+            operation, args = self.pending_client_mod_request
+            self.pending_client_mod_request = None
+            QTimer.singleShot(0, lambda: self._start_client_mod_worker(operation, *args))
+
+    def check_selected_mod_updates(self):
+        mod = self._selected_client_mod()
+        if mod:
+            self._start_client_mod_worker("update", self._game_root(), mod)
+
+    def check_selected_mod_dependencies(self):
+        mod = self._selected_client_mod()
+        if not mod:
+            return
+        if mod.project_id:
+            self._start_client_mod_worker("dependencies", mod.project_id)
+        else:
+            self._start_client_mod_worker("lookup", self._game_root(), mod)
+
+    def _client_mod_worker_succeeded(self, operation: str, result: object):
+        if operation == "lookup":
+            if not isinstance(result, dict) or not result.get("project"):
+                QMessageBox.information(self, "Modrinth Match Not Found", "This JAR was not found on Modrinth.")
+            else:
+                self._refresh_client_mods()
+                project_id = str(result["project"].get("id") or "")
+                QTimer.singleShot(0, lambda: self._start_client_mod_worker("dependencies", project_id))
+            return
+        self._dispatch_client_mod_worker_result(operation, result)
+
+    def _dispatch_client_mod_worker_result(self, operation: str, result: object):
+        """Dispatch Modrinth worker results; kept separate for easy UI updates."""
+        if operation == "install":
+            self.pending_mod_install = None
+            self._refresh_client_mods()
+            if self.add_mod_dialog:
+                self.add_mod_dialog.accept()
+            QMessageBox.information(self, "Mod Added", "The selected mod and its required dependencies were added.")
+        elif operation == "update":
+            if not isinstance(result, dict) or not result.get("project"):
+                QMessageBox.information(self, "Modrinth Match Not Found", "This JAR was not found on Modrinth, so update information is unavailable.")
+                return
+            project, version = result.get("project"), result.get("version")
+            if not version:
+                QMessageBox.information(self, "No Compatible Versions", "No Forge 1.20.1 version is available for this mod.")
+            elif not result.get("has_update"):
+                QMessageBox.information(self, "No Update Available", f"{project.get('title', 'This mod')} is up to date ({version.get('version_number', 'latest')}).")
+            else:
+                answer = QMessageBox.question(self, "Mod Update Available", f"{project.get('title', 'This mod')} {version.get('version_number', '')} is available. Replace the current JAR?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
+                if answer == QMessageBox.StandardButton.Yes:
+                    mod = result.get("mod")
+                    root = result.get("root", self._game_root())
+                    QTimer.singleShot(0, lambda: self._start_client_mod_worker("install", root, project, version, [], mod))
+        elif operation == "dependencies":
+            projects = result.get("projects", []) if isinstance(result, dict) else []
+            versions = result.get("versions", []) if isinstance(result, dict) else []
+            names = [str(item.get("title", item.get("slug", item.get("id", "Dependency")))) for item in projects if isinstance(item, dict)]
+            names += [str(item.get("name", item.get("version_number", "Version"))) for item in versions if isinstance(item, dict)]
+            QMessageBox.information(self, "Mod Dependencies", "\n".join(dict.fromkeys(names)) if names else "Modrinth lists no dependencies for this project.")
 
     def _clear_console(self):
         self.console_output.clear()

@@ -23,7 +23,7 @@ from pathlib import Path, PurePosixPath
 from typing import Callable
 
 DOWNLOAD_PAGE = "https://wibsverse.com/download"
-LAUNCHER_VERSION = "0.4"
+LAUNCHER_VERSION = "0.5"
 LAUNCHER_RELEASES_API = "https://api.github.com/repos/YeeticusFinch/wibseverse-launcher/releases"
 SERVER = "play.wibsverse.com"
 MINECRAFT_VERSION = "1.20.1"
